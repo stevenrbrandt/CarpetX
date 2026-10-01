@@ -1,5 +1,6 @@
 #include "rk_methods.hxx"
 #include "solve.hxx"
+#include "IMEX32L_coeffs.hpp"
 
 // Driver primitives for the state-based refinement-boundary fill
 // (StoreRKOldState, StoreRKStage, FillRKBoundary).
@@ -128,7 +129,7 @@ extern "C" void ODESolvers_Solve_Subcycling(CCTK_ARGUMENTS) {
   DECLARE_CCTK_PARAMETERS;
 
   if (CCTK_EQUALS(method, "RK4-2") || CCTK_EQUALS(method, "RK4-3") ||
-      CCTK_EQUALS(method, "RK42-IMEX"))
+      CCTK_EQUALS(method, "RK42-IMEX") || CCTK_EQUALS(method, "RK42-IMEX2L"))
     CCTK_VERROR("ODESolvers method \"%s\" keeps RHS history in extra time "
                 "levels and is not implemented for CarpetX::use_subcycling. "
                 "Set Driver::use_subcycling = no.",
@@ -349,6 +350,9 @@ extern "C" void ODESolvers_Solve_Subcycling(CCTK_ARGUMENTS) {
     synchronize();
   };
 
+  // c_exp and c_imp are the explicit and implicit abscissae. They are equal
+  // for IMEX42L. IMEX-SSP3(3,3,2) evaluates the flux and the source of a
+  // stage at different times, so the two vectors differ there.
   const auto run_imex =
       [&](const imex_tableau_t &tableau) {
         const int nstages = tableau.nstages;
@@ -434,6 +438,11 @@ extern "C" void ODESolvers_Solve_Subcycling(CCTK_ARGUMENTS) {
             calcpoststep();
           }
 
+          if (c_exp.at(stage) != c_imp.at(stage)) {
+            *const_cast<CCTK_REAL *>(&cctkGH->cctk_time) =
+                old_time + c_exp.at(stage) * dt;
+            calcys_rmbnd(stage + 1);
+          }
           calcrhs(stage + 1);
           fks.push_back(rhs.copy(make_valid_int()));
           gks.push_back(std::move(g));
