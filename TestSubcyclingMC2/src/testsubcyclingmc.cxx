@@ -1,5 +1,4 @@
 #include <loop_device.hxx>
-#include <subcycling.hxx>
 
 #include <derivs.hxx>
 #include <mat.hxx>
@@ -19,6 +18,8 @@
 namespace TestSubcyclingMC2 {
 using namespace Arith;
 using namespace Loop;
+using std::array;
+using std::result_of_t;
 
 constexpr int dim = 3;
 

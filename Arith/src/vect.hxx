@@ -17,7 +17,6 @@
 #include <vector>
 
 namespace Arith {
-using namespace std;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -93,7 +92,8 @@ template <typename T, int D> struct vect {
   constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect(ntuple_t<T, D> tup)
       : elts(array_from_tuple<T, D>(std::move(tup))) {}
 #endif
-  constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect(initializer_list<T> lst)
+  constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST
+  vect(std::initializer_list<T> lst)
       : elts(construct_array<T, D>([&](size_t d) ARITH_INLINE {
 #ifdef CCTK_DEBUG
           assert(d < lst.size());
@@ -101,7 +101,7 @@ template <typename T, int D> struct vect {
           return lst.begin()[d];
         })) {
   }
-  constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect(const vector<T> &vec)
+  constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect(const std::vector<T> &vec)
       : elts(construct_array<T, D>([&](size_t d) ARITH_INLINE {
 #ifdef CCTK_DEBUG
           return vec.at(d);
@@ -110,7 +110,7 @@ template <typename T, int D> struct vect {
 #endif
         })) {
   }
-  constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect(vector<T> &&vec)
+  constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect(std::vector<T> &&vec)
       : elts(construct_array<T, D>([&](size_t d) ARITH_INLINE {
 #ifdef CCTK_DEBUG
           return vec.at(d);
@@ -161,8 +161,8 @@ template <typename T, int D> struct vect {
   }
 
   template <typename F, typename... Args,
-            typename R =
-                remove_cv_t<remove_reference_t<result_of_t<F(T, Args...)> > > >
+            typename R = std::remove_cv_t<
+                std::remove_reference_t<std::result_of_t<F(T, Args...)> > > >
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect<R, D>
   fmap(const F &f, const vect &x, const vect<Args, D> &...args) {
     return vect<R, D>::make(
@@ -177,8 +177,8 @@ template <typename T, int D> struct vect {
   // TODO: scan, exscan
 
   template <typename Op, typename R, typename... Args,
-            typename = remove_cv_t<
-                remove_reference_t<result_of_t<Op(R, T, Args...)> > > >
+            typename = std::remove_cv_t<std::remove_reference_t<
+                std::result_of_t<Op(R, T, Args...)> > > >
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST R
   fold(const Op &op, R r, const vect &x, const vect<Args, D> &...args) {
     loop([&](int d) ARITH_INLINE { r = op(r, x[d], args[d]...); });
@@ -584,15 +584,15 @@ template <typename T, int D> struct vect {
   }
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect<bool, D>
   operator>(const T &a, const vect &x) {
-    return a < x;
+    return x < a;
   }
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect<bool, D>
   operator<=(const T &a, const vect &x) {
-    return !(x > a);
+    return !(a > x);
   }
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect<bool, D>
   operator>=(const T &a, const vect &x) {
-    return !(x < a);
+    return !(a < x);
   }
 
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect<bool, D>
@@ -737,7 +737,7 @@ template <typename T, int D> struct vect {
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST T
   maximum(const vect &x) {
     return fold([&](const T &a, const T &b) ARITH_INLINE { return max1(a, b); },
-                -numeric_limits<T>::infinity(), x);
+                -std::numeric_limits<T>::infinity(), x);
   }
 
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST vect
@@ -765,7 +765,7 @@ template <typename T, int D> struct vect {
 
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST T
   minimum(const vect &x) {
-    return fold(min1, numeric_limits<T>::infinity(), x);
+    return fold(min1, std::numeric_limits<T>::infinity(), x);
   }
 
   friend constexpr ARITH_INLINE ARITH_DEVICE ARITH_HOST T prod(const vect &x) {
@@ -785,7 +785,7 @@ template <typename T, int D> struct vect {
                 zero<T>()(), x);
   }
 
-  friend ostream &operator<<(ostream &os, const vect &x) {
+  friend std::ostream &operator<<(std::ostream &os, const vect &x) {
     os << "[";
     for (int d = 0; d < D; ++d) {
       if (d > 0)
@@ -844,6 +844,16 @@ template <typename T, int D> struct less<Arith::vect<T, D> > {
         return false;
     }
     return false;
+  }
+};
+
+// Consistent with `equal_to` above, i.e. it hashes every component
+template <typename T, int D> struct hash<Arith::vect<T, D> > {
+  std::size_t operator()(const Arith::vect<T, D> &x) const {
+    std::size_t h = 0;
+    for (int d = 0; d < D; ++d)
+      h ^= hash<T>()(x.elts[d]) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
   }
 };
 

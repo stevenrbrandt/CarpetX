@@ -860,10 +860,8 @@ template <typename T, int CI, int CJ, int CK> struct GF3D {
 template <typename T> struct GF3D1 {
   typedef T value_type;
   T *restrict ptr;
-#ifdef CCTK_DEBUG
   vect<int, dim> imin, imax;
   vect<int, dim> ash;
-#endif
   static constexpr int di = 1;
   int dj, dk, np;
   int off;
@@ -875,9 +873,7 @@ template <typename T> struct GF3D1 {
   GF3D1(T *restrict ptr, const vect<int, dim> &imin, const vect<int, dim> &imax,
         const vect<int, dim> &ash)
       : ptr(ptr),
-#ifdef CCTK_DEBUG
         imin(imin), imax(imax), ash(ash),
-#endif
         dj(di * ash[0]), dk(dj * ash[1]), np(dk * ash[2]),
         off(imin[0] * di + imin[1] * dj + imin[2] * dk) {
   }
@@ -924,10 +920,8 @@ template <typename T> struct GF3D1 {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct GF3D2layout {
-#ifdef CCTK_DEBUG
   vect<int, dim> imin, imax;
   vect<int, dim> ash;
-#endif
   static constexpr int di = 1;
   int dj, dk, np;
   int off;
@@ -940,9 +934,7 @@ struct GF3D2layout {
                                     const vect<int, dim> &imax,
                                     const vect<int, dim> &ash)
       :
-#ifdef CCTK_DEBUG
         imin(imin), imax(imax), ash(ash),
-#endif
         dj(di * ash[0]), dk(dj * ash[1]), np(dk * ash[2]),
         off(imin[0] * di + imin[1] * dj + imin[2] * dk) {
   }
@@ -996,39 +988,30 @@ struct GF3D2layout {
   CCTK_DEVICE CCTK_HOST bool operator!=(const GF3D2layout &other) const {
     return !(*this == other);
   }
-  CCTK_DEVICE CCTK_HOST int linear(int i, int j, int k) const {
+  CCTK_DEVICE CCTK_HOST int linear(int i, int j, int k, int n = 0) const {
     // These index checks prevent vectorization. We thus only enable
     // them in debug mode.
 #ifdef CCTK_DEBUG
     assert(i >= imin[0] && i < imax[0]);
     assert(j >= imin[1] && j < imax[1]);
     assert(k >= imin[2] && k < imax[2]);
+    assert(n >= 0);
 #endif
-    return i * di + j * dj + k * dk - off;
+    return i * di + j * dj + k * dk + n * np - off;
   }
-  CCTK_DEVICE CCTK_HOST
-  inline int linear(int i, int j, int k, int c) const
-  {
-#ifdef CCTK_DEBUG
-    assert(c >= 0 && "component index must be non-negative");
-#endif
-    return linear(i, j, k) + c * np;
+  CCTK_DEVICE CCTK_HOST int linear(const vect<int, dim> &I, int n = 0) const {
+    return linear(I[0], I[1], I[2], n);
   }
-  CCTK_DEVICE CCTK_HOST int linear(const vect<int, dim> &I) const {
-    return linear(I[0], I[1], I[2]);
+  CCTK_DEVICE CCTK_HOST int delta(int i, int j, int k, int n = 0) const {
+    return i * di + j * dj + k * dk + n * np;
   }
-  CCTK_DEVICE CCTK_HOST int delta(int i, int j, int k) const {
-    return i * di + j * dj + k * dk;
-  }
-  CCTK_DEVICE CCTK_HOST int delta(const vect<int, dim> &I) const {
-    return delta(I[0], I[1], I[2]);
+  CCTK_DEVICE CCTK_HOST int delta(const vect<int, dim> &I, int n = 0) const {
+    return delta(I[0], I[1], I[2], n);
   }
 };
 
 struct GF3D2index {
-#ifdef CCTK_DEBUG
   GF3D2layout layout;
-#endif
   int m_linear;
   GF3D2index() = delete;
   GF3D2index(const GF3D2index &) = default;
@@ -1036,12 +1019,10 @@ struct GF3D2index {
   GF3D2index &operator=(const GF3D2index &) = default;
   GF3D2index &operator=(GF3D2index &&) = default;
   CCTK_DEVICE CCTK_HOST GF3D2index(const GF3D2layout &layout,
-                                   const vect<int, dim> &I)
+                                   const vect<int, dim> &I, int n = 0)
       :
-#ifdef CCTK_DEBUG
         layout(layout),
-#endif
-        m_linear(layout.linear(I)) {
+        m_linear(layout.linear(I, n)) {
   }
   CCTK_DEVICE CCTK_HOST int linear() const { return m_linear; }
 };
@@ -1059,20 +1040,21 @@ template <typename T> struct GF3D2 {
   GF3D2 &operator=(GF3D2 &&) = default;
   CCTK_DEVICE CCTK_HOST GF3D2(const GF3D2layout &layout, T *restrict ptr)
       : ptr(ptr), layout(layout) {}
-  CCTK_DEVICE CCTK_HOST GF3D2index index(const vect<int, dim> &I) const {
-    return GF3D2index(layout, I);
+  CCTK_DEVICE CCTK_HOST GF3D2index index(const vect<int, dim> &I,
+                                         int n = 0) const {
+    return GF3D2index(layout, I, n);
   }
-  CCTK_DEVICE CCTK_HOST int linear(const vect<int, dim> &I) const {
-    return index(I).linear();
+  CCTK_DEVICE CCTK_HOST int linear(const vect<int, dim> &I, int n = 0) const {
+    return index(I, n).linear();
   }
-  CCTK_DEVICE CCTK_HOST int linear(int i, int j, int k) const {
-    return index(vect<int, dim>{i, j, k}).linear();
+  CCTK_DEVICE CCTK_HOST int linear(int i, int j, int k, int n = 0) const {
+    return index(vect<int, dim>{i, j, k}, n).linear();
   }
-  CCTK_DEVICE CCTK_HOST int delta(const vect<int, dim> &I) const {
-    return layout.delta(I);
+  CCTK_DEVICE CCTK_HOST int delta(const vect<int, dim> &I, int n = 0) const {
+    return layout.delta(I, n);
   }
-  CCTK_DEVICE CCTK_HOST int delta(int i, int j, int k) const {
-    return layout.delta(i, j, k);
+  CCTK_DEVICE CCTK_HOST int delta(int i, int j, int k, int n = 0) const {
+    return layout.delta(i, j, k, n);
   }
   CCTK_DEVICE CCTK_HOST T &restrict operator()(const GF3D2index &index) const {
 #ifdef CCTK_DEBUG
@@ -1080,11 +1062,13 @@ template <typename T> struct GF3D2 {
 #endif
     return ptr[index.linear()];
   }
-  CCTK_DEVICE CCTK_HOST T &restrict operator()(const vect<int, dim> &I) const {
-    return ptr[linear(I)];
+  CCTK_DEVICE CCTK_HOST T &restrict operator()(const vect<int, dim> &I,
+                                               int n = 0) const {
+    return ptr[linear(I, n)];
   }
-  CCTK_DEVICE CCTK_HOST T &restrict operator()(int i, int j, int k) const {
-    return ptr[linear(i, j, k)];
+  CCTK_DEVICE CCTK_HOST T &restrict operator()(int i, int j, int k,
+                                               int n = 0) const {
+    return ptr[linear(i, j, k, n)];
   }
   CCTK_DEVICE CCTK_HOST void store(const GF3D2index &index,
                                    const T &value) const {
@@ -1093,6 +1077,10 @@ template <typename T> struct GF3D2 {
   CCTK_DEVICE CCTK_HOST void store(const vect<int, dim> &I,
                                    const T &value) const {
     ptr[linear(I)] = value;
+  }
+  CCTK_DEVICE CCTK_HOST void store(const vect<int, dim> &I, int n,
+                                   const T &value) const {
+    ptr[linear(I, n)] = value;
   }
 #if 0
   struct simd_reference {
@@ -1175,8 +1163,8 @@ template <typename T> struct GF3D2 {
   }
   CCTK_DEVICE CCTK_HOST Arith::simd<std::remove_cv_t<T> >
   operator()(const Arith::simdl<std::remove_cv_t<T> > &mask,
-             const vect<int, dim> &I) const {
-    return (*this)(mask, GF3D2index(layout, I));
+             const vect<int, dim> &I, int n = 0) const {
+    return (*this)(mask, GF3D2index(layout, I, n));
   }
   CCTK_DEVICE CCTK_HOST Arith::simd<std::remove_cv_t<T> >
   operator()(const Arith::simdl<std::remove_cv_t<T> > &mask,
@@ -1197,6 +1185,12 @@ template <typename T> struct GF3D2 {
              const Arith::simd<std::remove_cv_t<T> > &other) const {
     return Arith::masko_loadu(mask, &(*this)(I), other);
   }
+  CCTK_DEVICE CCTK_HOST Arith::simd<std::remove_cv_t<T> >
+  operator()(const Arith::simdl<std::remove_cv_t<T> > &mask,
+             const vect<int, dim> &I, int n,
+             const Arith::simd<std::remove_cv_t<T> > &other) const {
+    return Arith::masko_loadu(mask, &(*this)(I, n), other);
+  }
   template <typename U,
             std::enable_if_t<std::is_convertible_v<T, U> > * = nullptr>
   CCTK_DEVICE CCTK_HOST Arith::simd<std::remove_cv_t<T> >
@@ -1204,10 +1198,22 @@ template <typename T> struct GF3D2 {
              const vect<int, dim> &I, const U &other) const {
     return Arith::masko_loadu(mask, &(*this)(I), other);
   }
+  template <typename U,
+            std::enable_if_t<std::is_convertible_v<T, U> > * = nullptr>
+  CCTK_DEVICE CCTK_HOST Arith::simd<std::remove_cv_t<T> >
+  operator()(const Arith::simdl<std::remove_cv_t<T> > &mask,
+             const vect<int, dim> &I, int n, const U &other) const {
+    return Arith::masko_loadu(mask, &(*this)(I, n), other);
+  }
   CCTK_DEVICE CCTK_HOST void store(const Arith::simdl<T> &mask,
                                    const vect<int, dim> &I,
                                    const Arith::simd<T> &value) const {
     mask_storeu(mask, &ptr[linear(I)], value);
+  }
+  CCTK_DEVICE CCTK_HOST void store(const Arith::simdl<T> &mask,
+                                   const vect<int, dim> &I, int n,
+                                   const Arith::simd<T> &value) const {
+    mask_storeu(mask, &ptr[linear(I, n)], value);
   }
   CCTK_DEVICE CCTK_HOST void store(const Arith::simdl<T> &mask,
                                    const GF3D2index &index,
@@ -1302,10 +1308,8 @@ struct GF3D3ptr : GF3D3layout<NI, NJ, NK, OFF> {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct GF3D5layout {
-#ifdef CCTK_DEBUG
   vect<int, dim> imin, imax;
   vect<int, dim> ash;
-#endif
   static constexpr int di = 1;
   int dj, dk, np;
   int off;
@@ -1318,9 +1322,7 @@ struct GF3D5layout {
                                     const vect<int, dim> &imax,
                                     const vect<int, dim> &ash)
       :
-#ifdef CCTK_DEBUG
         imin(imin), imax(imax), ash(ash),
-#endif
         dj(di * ash[0]), dk(dj * ash[1]), np(dk * ash[2]),
         off(imin[0] * di + imin[1] * dj + imin[2] * dk) {
   }
@@ -1393,9 +1395,7 @@ struct GF3D5layout {
 };
 
 struct GF3D5index {
-#ifdef CCTK_DEBUG
   GF3D5layout layout;
-#endif
   int m_linear;
   GF3D5index() = delete;
   GF3D5index(const GF3D5index &) = default;
@@ -1405,9 +1405,7 @@ struct GF3D5index {
   CCTK_DEVICE CCTK_HOST GF3D5index(const GF3D5layout &layout,
                                    const vect<int, dim> &I)
       :
-#ifdef CCTK_DEBUG
         layout(layout),
-#endif
         m_linear(layout.linear(I)) {
   }
   CCTK_DEVICE CCTK_HOST int linear() const { return m_linear; }
@@ -1415,9 +1413,7 @@ struct GF3D5index {
 
 template <typename T> struct GF3D5 {
   typedef T value_type;
-#ifdef CCTK_DEBUG
   GF3D5layout layout;
-#endif
   T *restrict ptr;
   GF3D5() = delete;
   GF3D5(const GF3D5 &) = default;
@@ -1426,9 +1422,7 @@ template <typename T> struct GF3D5 {
   GF3D5 &operator=(GF3D5 &&) = default;
   CCTK_DEVICE CCTK_HOST GF3D5(const GF3D5layout &layout, T *restrict ptr)
       :
-#ifdef CCTK_DEBUG
         layout(layout),
-#endif
         ptr(ptr) {
 #ifdef CCTK_DEBUG
     assert(&(*this)(layout, layout.imin) == ptr);

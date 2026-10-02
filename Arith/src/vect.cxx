@@ -1,7 +1,6 @@
 #include "vect.hxx"
 
 namespace Arith {
-using namespace std;
 
 namespace TestVect {
 // constexpr vect<int, 3> vect1(make_tuple(0, 1, 2));
@@ -27,6 +26,18 @@ static_assert(vect2[1][2] == 112, "");
 static_assert(vect2[2][0] == 120, "");
 static_assert(vect2[2][1] == 121, "");
 static_assert(vect2[2][2] == 122, "");
+
+// Comparisons against a scalar, with the scalar on either side. These must
+// agree component by component with the underlying scalar comparison.
+constexpr vect<int, 3> vect3(std::array<int, 3>{1, 2, 3});
+static_assert(all((vect3 < 2) == vect<bool, 3>{true, false, false}), "");
+static_assert(all((vect3 > 2) == vect<bool, 3>{false, false, true}), "");
+static_assert(all((vect3 <= 2) == vect<bool, 3>{true, true, false}), "");
+static_assert(all((vect3 >= 2) == vect<bool, 3>{false, true, true}), "");
+static_assert(all((2 < vect3) == vect<bool, 3>{false, false, true}), "");
+static_assert(all((2 > vect3) == vect<bool, 3>{true, false, false}), "");
+static_assert(all((2 <= vect3) == vect<bool, 3>{false, true, true}), "");
+static_assert(all((2 >= vect3) == vect<bool, 3>{true, true, false}), "");
 
 } // namespace TestVect
 

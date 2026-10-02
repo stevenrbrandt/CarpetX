@@ -43,9 +43,9 @@ void OutputNorms(const cGH *restrict cctkGH) {
         }};
     CCTK_TraverseString(out_norm_vars, callback, &enabled, CCTK_GROUP_OR_VAR);
     if (verbose) {
-      CCTK_VINFO("TSV output for groups:");
+      CCTK_VINFO("Norm output for groups:");
       for (int gi = 0; gi < CCTK_NumGroups(); ++gi)
-        if (group_enabled.at(gi))
+        if (enabled.at(gi))
           CCTK_VINFO("  %s", CCTK_FullGroupName(gi));
     }
     return enabled;
@@ -201,8 +201,8 @@ void OutputNorms(const cGH *restrict cctkGH) {
 
       // get more precision for floats, could also use
       // https://stackoverflow.com/a/30968371
-      file << setprecision(std::numeric_limits<CCTK_REAL>::digits10 + 1)
-           << scientific;
+      file << std::setprecision(std::numeric_limits<CCTK_REAL>::digits10 + 1)
+           << std::scientific;
 
       file << cctk_iteration << sep << cctk_time;
     }

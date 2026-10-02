@@ -1,7 +1,6 @@
 #include "driver.hxx"
 
 #include "boundaries.hxx"
-#include "cf_mask.hxx"
 #include "fillpatch.hxx"
 #include "interp.hxx"
 #include "io.hxx"
@@ -9,6 +8,7 @@
 #include "loop_device.hxx"
 #include "prolongate_3d_rf2.hxx"
 #include "schedule.hxx"
+#include "subcycling.hxx"
 #include "timer.hxx"
 
 #include <cctk.h>
@@ -21,7 +21,6 @@
 #include <AMReX_FillPatchUtil.H>
 #include <AMReX_ParmParse.H>
 
-#include <omp.h>
 #include <mpi.h>
 
 #include <algorithm>
@@ -47,6 +46,8 @@ int ghext_handle = -1;
 
 amrex::AMReX *restrict pamrex = nullptr;
 std::unique_ptr<GHExt> ghext;
+
+std::atomic<CCTK_INT> carpetx_epoch{0};
 
 // Registered functions
 
@@ -77,6 +78,28 @@ extern "C" CCTK_INT CarpetX_GetBoundarySizesAndTypes(
     const void *cctkGH_, CCTK_INT patch, CCTK_INT size,
     CCTK_INT *restrict const bndsize, CCTK_INT *restrict const is_ghostbnd,
     CCTK_INT *restrict const is_symbnd, CCTK_INT *restrict const is_physbnd);
+
+/* Return the current AMR grid epoch — a monotonically increasing counter that
+ * is incremented whenever the grid hierarchy is structurally modified.
+ *
+ * Specifically, the epoch advances on:
+ *   - Level creation   (MakeNewLevelFromScratch, MakeNewLevelFromCoarse)
+ *   - Level remeshing  (RemakeLevel)
+ *   - Level removal    (ClearLevel)
+ *   - Checkpoint recovery (InputInitial)
+ *
+ * Callers that cache data derived from the grid topology (e.g. interpolation
+ * setup objects) can use this value as a cheap validity stamp: if the epoch
+ * returned here differs from the one stored when the cache was built, the
+ * cached data must be rebuilt before use.
+ *
+ * The counter starts at 0 and is read atomically with relaxed ordering, which
+ * is safe for a simple snapshot — no synchronisation with other memory
+ * operations is implied or required.
+ */
+extern "C" CCTK_INT CarpetX_GetEpoch(void) {
+  return carpetx_epoch.load(std::memory_order_relaxed);
+}
 
 // Local functions
 void SetupGlobals();
@@ -142,7 +165,7 @@ std::array<std::array<symmetry_t, dim>, 2> get_symmetries(const int patch) {
       {{bool(periodic && periodic_x), bool(periodic && periodic_y),
         bool(periodic && periodic_z)}},
   }};
-  const array<array<bool, 3>, 2> is_reflection{{
+  const std::array<std::array<bool, 3>, 2> is_reflection{{
       {{bool(reflection_x), bool(reflection_y), bool(reflection_z)}},
       {{bool(reflection_upper_x), bool(reflection_upper_y),
         bool(reflection_upper_z)}},
@@ -413,7 +436,7 @@ std::array<int, dim> get_group_indextype(const int gi) {
   }
 
   // Convert to index type
-  array<int, dim> indextype;
+  std::array<int, dim> indextype;
   for (int d = 0; d < dim; ++d)
     indextype[d] = index[d];
 
@@ -440,7 +463,7 @@ std::array<int, dim> get_group_fluxes(const int gi) {
   std::size_t end = 0;
   while (end < str.size()) {
     const std::size_t begin = str.find_first_not_of(' ', end);
-    if (begin == string::npos)
+    if (begin == std::string::npos)
       break;
     end = str.find(' ', begin);
     strs.push_back(str.substr(begin, end - begin));
@@ -454,9 +477,9 @@ std::array<int, dim> get_group_fluxes(const int gi) {
   assert(strs.size() == dim); // Check number of fluxes
   for (int d = 0; d < dim; ++d) {
     auto str1 = strs[d];
-    if (str1.find(':') == string::npos) {
+    if (str1.find(':') == std::string::npos) {
       const char *const impl = CCTK_GroupImplementationI(gi);
-      str1 = string(impl) + "::" + str1;
+      str1 = std::string(impl) + "::" + str1;
     }
     int gi1 = CCTK_GroupIndex(str1.c_str());
     assert(gi1 >= 0); // Check fluxes are valid groups
@@ -467,6 +490,63 @@ std::array<int, dim> get_group_fluxes(const int gi) {
     for (int d1 = d + 1; d1 < dim; ++d1)
       assert(fluxes[d] != fluxes[d1]); // Check groups are all different
   return fluxes;
+}
+
+// See subcycling.hxx for the contract. The bounds check is what makes an
+// empty vector (ODESolvers inactive) mean "nothing is integrated".
+bool group_is_integrated(const int gi) {
+  assert(gi >= 0 && gi < CCTK_NumGroups());
+  const std::vector<bool> &integrated = ghext->rk_integrated_group;
+  return gi < int(integrated.size()) && integrated.at(gi);
+}
+
+// See subcycling.hxx for the contract. The conditions are ordered so that
+// the fluxes= tag is parsed only for integrated grid functions: its asserts
+// (malformed tag) then fire on no group whose register allocation would not
+// parse it anyway.
+bool group_has_flux_register(const int gi) {
+  assert(gi >= 0 && gi < CCTK_NumGroups());
+  return ghext->do_reflux && CCTK_GroupTypeI(gi) == CCTK_GF &&
+         group_is_integrated(gi) && get_group_fluxes(gi)[0] >= 0;
+}
+
+// See driver.hxx for the contract. With do_reflux set, the only way a
+// flux-tagged grid function fails group_has_flux_register is not being
+// integrated by ODESolvers, hence the wording. Parsing the fluxes= tag of
+// every grid function is no stricter than the GroupData constructor, which
+// parses it for every group on every level. Every process reaches the same
+// verdict from the same tags and parameters, so only the root warns, and the
+// warning appears once per run rather than once per process.
+void warn_inert_flux_tags() {
+  DECLARE_CCTK_PARAMETERS;
+  if (max_num_levels <= 1)
+    return;
+  if (CCTK_MyProc(nullptr) != 0)
+    return;
+  if (!ghext->do_reflux) {
+    // Every fluxes= tag is inert; say so once if one would have taken effect
+    for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+      if (CCTK_GroupTypeI(gi) == CCTK_GF && group_is_integrated(gi) &&
+          get_group_fluxes(gi)[0] >= 0) {
+        CCTK_INFO("Grid functions integrated by ODESolvers carry fluxes= "
+                  "tags, but refluxing at coarse-fine boundaries is off; set "
+                  "CarpetX::do_reflux = yes to enable it");
+        break;
+      }
+    }
+    return;
+  }
+  for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+    if (CCTK_GroupTypeI(gi) != CCTK_GF || get_group_fluxes(gi)[0] < 0 ||
+        group_has_flux_register(gi))
+      continue;
+    CCTK_VWARN(CCTK_WARN_ALERT,
+               "Group \"%s\" has a fluxes= tag but is not integrated by "
+               "ODESolvers: no flux register is allocated for it, and it is "
+               "not refluxed at coarse-fine boundaries (see "
+               "CarpetX::do_reflux)",
+               CCTK_FullGroupName(gi));
+  }
 }
 
 std::array<int, dim> get_group_nghostzones(const int gi) {
@@ -720,8 +800,8 @@ GHExt::PatchData::PatchData(const int patch) : patch(patch) {
       symmetries[0][1] == symmetry_t::periodic,
       symmetries[0][2] == symmetry_t::periodic};
 
-  amrcore = make_unique<CactusAmrCore>(patch, domain, max_num_levels - 1,
-                                       ncells, coord, reffacts, is_periodic);
+  amrcore = std::make_unique<CactusAmrCore>(
+      patch, domain, max_num_levels - 1, ncells, coord, reffacts, is_periodic);
 
   if (verbose) {
 #pragma omp critical
@@ -729,7 +809,7 @@ GHExt::PatchData::PatchData(const int patch) : patch(patch) {
       const int maxnumlevels = amrcore->maxLevel() + 1;
       for (int level = 0; level < maxnumlevels; ++level) {
         CCTK_VINFO("amrex::Geometry level %d:", level);
-        cout << amrcore->Geom(level) << "\n";
+        std::cout << amrcore->Geom(level) << "\n";
       }
     }
   }
@@ -738,7 +818,7 @@ GHExt::PatchData::PatchData(const int patch) : patch(patch) {
 GHExt::PatchData::LevelData::LevelData(const int patch, const int level,
                                        const amrex::BoxArray &ba,
                                        const amrex::DistributionMapping &dm,
-                                       const function<string()> &why)
+                                       const std::function<std::string()> &why)
     : patch(patch), level(level) {
   DECLARE_CCTK_PARAMETERS;
 
@@ -760,7 +840,7 @@ GHExt::PatchData::LevelData::LevelData(const int patch, const int level,
       ghost_size >= 0 ? ghost_size : ghost_size_x,
       ghost_size >= 0 ? ghost_size : ghost_size_y,
       ghost_size >= 0 ? ghost_size : ghost_size_z};
-  fab = make_unique<amrex::FabArrayBase>(ba, dm, 1, nghostzones);
+  fab = std::make_unique<amrex::FabArrayBase>(ba, dm, 1, nghostzones);
   assert(ba.ixType() == amrex::IndexType(amrex::IndexType::CELL,
                                          amrex::IndexType::CELL,
                                          amrex::IndexType::CELL));
@@ -778,11 +858,24 @@ GHExt::PatchData::LevelData::LevelData(const int patch, const int level,
     if (group.grouptype != CCTK_GF)
       groupdata.emplace_back(nullptr);
     else
-      groupdata.push_back(make_unique<GHExt::PatchData::LevelData::GroupData>(
-          patch, level, gi, ba, dm, why));
+      groupdata.push_back(
+          std::make_unique<GHExt::PatchData::LevelData::GroupData>(
+              patch, level, gi, ba, dm, why));
   }
 
-  // Check flux register consistency
+  // Check flux register consistency: the flux group in direction d is
+  // face-centred in d and cell-centred elsewhere, and is not the state group
+  // itself. Checked for every group with a fluxes= tag on every level, not
+  // only where a register is allocated.
+  //
+  // Component contract: the leading `numvars` components of each flux group
+  // are the fluxes of the state group's components, in the same order; any
+  // further components are ignored by the register (AccumulateFluxes and
+  // Reflux only ever touch components 0 .. numvars-1). A flux group may thus
+  // carry more components than the state, e.g. transport terms of quantities
+  // that are not part of the state (AsterX's flux groups hold the fluxes of
+  // its seven conserved variables followed by three B-field transport
+  // components used by its constrained-transport electric field).
   for (int gi = 0; gi < numgroups; ++gi) {
     cGroup group;
     int ierr = CCTK_GroupData(gi, &group);
@@ -792,14 +885,14 @@ GHExt::PatchData::LevelData::LevelData(const int patch, const int level,
     if (group.grouptype != CCTK_GF)
       continue;
     const auto &groupdata = *this->groupdata.at(gi);
-    if (groupdata.freg) {
+    if (groupdata.fluxes[0] >= 0) {
       for (int d = 0; d < dim; ++d) {
         assert(groupdata.fluxes[d] != groupdata.groupindex);
         const auto &flux_groupdata = *this->groupdata.at(groupdata.fluxes[d]);
         std::array<int, dim> flux_indextype{1, 1, 1};
         flux_indextype[d] = 0;
         assert(flux_groupdata.indextype == flux_indextype);
-        assert(flux_groupdata.numvars == groupdata.numvars);
+        assert(flux_groupdata.numvars >= groupdata.numvars);
       }
     }
   }
@@ -834,7 +927,8 @@ GHExt::PatchData::LevelData::LevelData(const int patch, const int level,
 
 GHExt::PatchData::LevelData::GroupData::GroupData(
     const int patch, const int level, const int gi, const amrex::BoxArray &ba,
-    const amrex::DistributionMapping &dm, const function<string()> &why)
+    const amrex::DistributionMapping &dm,
+    const std::function<std::string()> &why)
     : patch(patch), level(level), next_tmp_mfab(0) {
   cGroup group;
   int ierr = CCTK_GroupData(gi, &group);
@@ -914,175 +1008,44 @@ GHExt::PatchData::LevelData::GroupData::GroupData(
   mfab.resize(ntls);
   valid.resize(ntls);
   for (int tl = 0; tl < ntls; ++tl) {
-    mfab.at(tl) = make_unique<amrex::MultiFab>(gba, dm, numvars,
-                                               amrex::IntVect(nghostzones));
+    mfab.at(tl) = std::make_unique<amrex::MultiFab>(
+        gba, dm, numvars, amrex::IntVect(nghostzones));
     valid.at(tl).resize(numvars, why_valid_t(why));
   }
 
-  if (level > 0) {
-    fluxes = get_group_fluxes(groupindex);
-    const bool have_fluxes = fluxes[0] >= 0;
-    if (have_fluxes) {
-      assert((indextype == array<int, dim>{1, 1, 1}));
-      freg = make_unique<amrex::FluxRegister>(
-          gba, dm, ghext->patchdata.at(patch).amrcore->refRatio(level - 1),
-          level, numvars);
+  // Flux-register (reflux) bookkeeping. The fluxes= tag is parsed on every
+  // level, so that the coarsest level also knows its flux groups: it feeds
+  // the register of the pair (0, 1) as the coarse side. The register itself
+  // belongs to the fine level of each pair and exists only where it can be
+  // filled: for a group ODESolvers integrates (rk_integrated_group, published
+  // at WRAGH before any level is made), whose fluxes are therefore computed
+  // in ODESolvers_RHS. group_has_flux_register is that rule; the same
+  // predicate decides ODESolvers_CheckMethod's rejection of implicit
+  // methods. Both solvers accumulate each RK stage's flux through
+  // AccumulateFluxes; the correction is applied to the coarse state once per
+  // coarse step, by the driver's evolve loop under subcycling and by
+  // ODESolvers_Solve at its final stage otherwise (Reflux). A flux-tagged
+  // group that is not integrated (e.g. a diagnostic computed at analysis)
+  // gets no register, and AccumulateFluxes never looks at it.
+  fluxes = get_group_fluxes(groupindex);
+  if (fluxes[0] >= 0) {
+    assert((indextype == std::array<int, dim>{1, 1, 1}));
+    if (level > 0 && group_has_flux_register(groupindex)) {
+      const amrex::IntVect ratio =
+          ghext->patchdata.at(patch).amrcore->refRatio(level - 1);
+      freg =
+          std::make_unique<amrex::FluxRegister>(gba, dm, ratio, level, numvars);
+      // FluxRegister::define leaves the FabSets uninitialized. Zero them so
+      // that a register that is never fed (e.g. ODESolvers::method =
+      // "constant") is a no-op in Reflux and serializes as zeros at a
+      // mid-cycle checkpoint.
+      freg->setVal(0);
+      // The coarse side's staging buffer (AccumulateFluxes): the register's
+      // layout by construction. Left uninitialized; every use zeroes it.
+      freg_scratch =
+          std::make_unique<amrex::FluxRegister>(gba, dm, ratio, level, numvars);
     }
-  } else {
-    fluxes.fill(-1);
   }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-void GHExt::PatchData::LevelData::build_cf_mask(
-    const std::array<int, dim> &indextype,
-    const std::array<int, dim> &nghostzones) const {
-  // Nothing to mask at the coarsest level or outside subcycling runs.
-  if (level == 0 || !ghext->use_subcycling)
-    return;
-
-  const int s = (indextype[0] << 2) | (indextype[1] << 1) | indextype[2];
-  if (cf_masks[s])
-    return; // already built (idempotent: warm-up runs every step)
-
-  const amrex::IntVect ng(nghostzones[0], nghostzones[1], nghostzones[2]);
-  const amrex::BoxArray gba = amrex::convert(
-      fab->boxArray(),
-      amrex::IndexType(
-          indextype[0] ? amrex::IndexType::CELL : amrex::IndexType::NODE,
-          indextype[1] ? amrex::IndexType::CELL : amrex::IndexType::NODE,
-          indextype[2] ? amrex::IndexType::CELL : amrex::IndexType::NODE));
-
-  auto mask = std::make_unique<amrex::iMultiFab>(gba, fab->DistributionMap(),
-                                                 /*ncomp=*/1, ng);
-  const auto &geom = ghext->patchdata.at(patch).amrcore->Geom(level);
-  // covered=0  : ghosts filled by same-level FillBoundary (intra-/inter-
-  //              process and periodic-image — see getFB(ngrow, period)
-  //              overlay in AMReX_FabArray.H).
-  // notcovered : coarse-fine prolongation ghosts. Set to cf_ghost (truthy).
-  // physbnd=0  : physical-outer boundary ghosts.
-  // interior=0 : not read by the consumer (loop_device_idx<ghosts>).
-  mask->BuildMask(geom.Domain(), geom.periodicity(),
-                  /*covered=*/0,
-                  /*notcovered=*/cf_ghost,
-                  /*physbnd=*/0,
-                  /*interior=*/0);
-  cf_masks[s] = std::move(mask);
-}
-
-amrex::iMultiFab *GHExt::PatchData::LevelData::get_cf_mask(
-    const std::array<int, dim> &indextype,
-    const std::array<int, dim> &nghostzones) const {
-  // Pure reader: no MFIter, no cache store, so concurrent reads are safe.
-  // The slot must have been warmed single-threaded via build_cf_mask; an
-  // un-warmed centering is a missing warm-up and trips the assert below.
-  if (level == 0 || !ghext->use_subcycling)
-    return nullptr;
-
-  const int s = (indextype[0] << 2) | (indextype[1] << 1) | indextype[2];
-  const amrex::IntVect ng(nghostzones[0], nghostzones[1], nghostzones[2]);
-  // Slot must be warm (build_cf_mask ran single-threaded). Sharing assumption:
-  // all groups of this centering at this level use the same nghostzones; if the
-  // nGrowVect check trips, widen the cache key from `centering` to
-  // `(centering, nghost)` inside build_cf_mask.
-  assert(cf_masks[s] && cf_masks[s]->nGrowVect() == ng);
-  return cf_masks[s].get();
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-void GHExt::PatchData::LevelData::build_bands(
-    const GroupData &groupdata) const {
-  // Bands only exist for evolved groups under subcycling.
-  if (!ghext->use_subcycling || !groupdata.do_evolve)
-    return;
-
-  const std::array<int, dim> &indextype = groupdata.indextype;
-  // Sharing assumption (as for cf_masks): all groups of this centering at this
-  // level use the same nghostzones and interpolator, so the band geometry can
-  // be cached per (level, centering).
-  const int s = (indextype[0] << 2) | (indextype[1] << 1) | indextype[2];
-
-  const auto &patchdata = ghext->patchdata.at(patch);
-  const amrex::IntVect ratio{2, 2, 2};
-  const amrex::InterpolaterBoxCoarsener &coarsener =
-      groupdata.interpolator->BoxCoarsener(ratio);
-  const amrex::EB2::IndexSpace *const index_space = nullptr;
-
-  // Recompute the band geometry from the current level layouts. AMReX can
-  // change a level's DistributionMapping without changing its BoxArray, so a
-  // child-BoxArray-only cache is not sufficient here. TheFPinfo maintains its
-  // own cache, making the unchanged-layout path inexpensive.
-  //
-  // Consumer band == this level's cf-ghost region (fpc.ba_fine_patch w.r.t.
-  // the parent). Empty at level 0.
-  amrex::BoxArray fba;
-  amrex::DistributionMapping fdm;
-  if (level > 0) {
-    const auto &mfab = *groupdata.mfab.at(0);
-    const amrex::IntVect &nghosts = mfab.nGrowVect();
-    const auto &fgeom = patchdata.amrcore->Geom(level);
-    const auto &cgeom = patchdata.amrcore->Geom(level - 1);
-    const amrex::FabArrayBase::FPinfo &fpc = amrex::FabArrayBase::TheFPinfo(
-        mfab, mfab, nghosts, coarsener, fgeom, cgeom, index_space);
-    fba = fpc.ba_fine_patch;
-    fdm = fpc.dm_patch;
-  }
-
-  // Source band == coarse cells under the next-finer level's cf-ghost
-  // footprint (child fpc.ba_crse_patch). Empty when this is the finest level.
-  amrex::BoxArray cba;
-  amrex::DistributionMapping cdm;
-  if (level + 1 < int(patchdata.leveldata.size())) {
-    const auto &childleveldata = patchdata.leveldata.at(level + 1);
-    const auto &childgroupdata =
-        *childleveldata.groupdata.at(groupdata.groupindex);
-    const auto &childmfab = *childgroupdata.mfab.at(0);
-    const amrex::IntVect &childnghosts = childmfab.nGrowVect();
-    const auto &fgeom = patchdata.amrcore->Geom(level + 1);
-    const auto &cgeom = patchdata.amrcore->Geom(level);
-    const amrex::FabArrayBase::FPinfo &fpc =
-        amrex::FabArrayBase::TheFPinfo(childmfab, childmfab, childnghosts,
-                                       coarsener, fgeom, cgeom, index_space);
-    cba = fpc.ba_crse_patch;
-    cdm = fpc.dm_patch;
-  }
-
-  if (!consumer_band_ba[s] || !consumer_band_dm[s] ||
-      *consumer_band_ba[s] != fba || *consumer_band_dm[s] != fdm) {
-    consumer_band_ba[s] = std::make_unique<amrex::BoxArray>(fba);
-    consumer_band_dm[s] = std::make_unique<amrex::DistributionMapping>(fdm);
-  }
-  if (!source_band_ba[s] || !source_band_dm[s] ||
-      *source_band_ba[s] != cba || *source_band_dm[s] != cdm) {
-    source_band_ba[s] = std::make_unique<amrex::BoxArray>(cba);
-    source_band_dm[s] = std::make_unique<amrex::DistributionMapping>(cdm);
-  }
-
-  // ---- Per-group band MultiFab allocation (idempotent, zero ghost) ----
-  const int numvars = groupdata.numvars;
-  const auto ensure_band = [&](auto &band, const amrex::BoxArray &ba,
-                               const amrex::DistributionMapping &dm) {
-    if (band && (band->boxArray() != ba || band->DistributionMap() != dm ||
-                 band->nComp() != numvars))
-      band.reset();
-    if (!band && !ba.empty())
-      band = std::make_unique<amrex::MultiFab>(ba, dm, numvars, 0);
-  };
-
-  for (int stage = 0; stage < ghext->num_rk_stages; ++stage) {
-    ensure_band(groupdata.ks_consumer_band[stage], *consumer_band_ba[s],
-                *consumer_band_dm[s]);
-    ensure_band(groupdata.ks_source_band[stage], *source_band_ba[s],
-                *source_band_dm[s]);
-  }
-
-  // Old-state bands (single snapshot, share the ks band geometry above).
-  ensure_band(groupdata.old_consumer_band, *consumer_band_ba[s],
-              *consumer_band_dm[s]);
-  ensure_band(groupdata.old_source_band, *source_band_ba[s],
-              *source_band_dm[s]);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1105,20 +1068,109 @@ extern "C" CCTK_INT CarpetX_ProvideAllLevelsSynchronized() {
   return all_levels_synchronized();
 }
 
+bool recovered_level_needs_rk_bands(const int patch, const int level) {
+  if (!ghext->use_subcycling)
+    return false;
+  const auto &iterations = ghext->recovered_level_iterations;
+  if (patch < 0 || patch >= int(iterations.size()))
+    return false;
+  const auto &level_iterations = iterations.at(patch);
+  const int child = level + 1;
+  if (level < 0 || child >= int(level_iterations.size()))
+    return false; // finest level: no children to fill
+  const std::optional<rat64> &self = level_iterations.at(level);
+  const std::optional<rat64> &child_iteration = level_iterations.at(child);
+  if (!self || !child_iteration)
+    return false; // old checkpoint without per-level iteration: time-aligned
+  // Under 2:1 time refinement the child is either aligned with this level or
+  // half a coarse step behind it; only in the latter case does the child's
+  // next substep read this level's in-progress step from the bands.
+  return *child_iteration < *self;
+}
+
+bool recovered_flux_register_is_live(const int patch, const int level) {
+  if (!ghext->use_subcycling)
+    return false;
+  const auto &iterations = ghext->recovered_level_iterations;
+  if (patch < 0 || patch >= int(iterations.size()))
+    return false;
+  const auto &level_iterations = iterations.at(patch);
+  if (level < 0 || level + 1 >= int(level_iterations.size()))
+    return false; // finest level: no register below it
+  const std::optional<rat64> &self = level_iterations.at(level);
+  if (!self)
+    return false; // old checkpoint without per-level iteration: time-aligned
+  // The pair (level, level + 1) is refluxed once every level from `level`
+  // down to the finest is time-aligned (see the evolve loop), so the
+  // register is live while any finer level is still behind this one. The
+  // pair (level, level + 1) may itself be aligned with the register complete
+  // but unapplied.
+  for (int finer = level + 1; finer < int(level_iterations.size()); ++finer) {
+    const std::optional<rat64> &finer_iteration = level_iterations.at(finer);
+    if (finer_iteration && *finer_iteration < *self)
+      return true;
+  }
+  return false;
+}
+
 std::string subcycling_band_tag(const band_kind kind, const int stage) {
   std::ostringstream buf;
   switch (kind) {
-  case band_kind::ks_consumer:
+  case band_kind::ks_source:
     assert(stage >= 0 && stage < max_num_rk_stages);
-    buf << "ksc_s" << std::setw(2) << std::setfill('0') << stage;
+    buf << "kss_s" << std::setw(2) << std::setfill('0') << stage;
     break;
-  case band_kind::old_consumer:
-    buf << "oldc";
+  case band_kind::old_source:
+    buf << "olds";
+    break;
+  case band_kind::flux_register:
+    assert(stage >= 0 && stage < 2 * dim);
+    buf << "freg_" << "xyz"[stage / 2] << (stage % 2 ? "hi" : "lo");
     break;
   default:
     assert(0);
   }
   return buf.str();
+}
+
+amrex::MultiFab *rk_source_band(const int patch, const int level, const int gi,
+                                const band_kind kind, const int stage) {
+  // The one place that decides which GroupData holds the band that level
+  // `level` fills as a parent: it is owned by the child level's GroupData,
+  // next to the child's rk_crse_patch / rk_fine_patch. The IO backends iterate
+  // the parent level (the bands sit in its index space and are serialized
+  // under its name) and reach the band through here.
+  const auto &patchdata = ghext->patchdata.at(patch);
+  assert(level >= 0);
+  if (level + 1 >= int(patchdata.leveldata.size()))
+    return nullptr; // finest level: no children to fill
+  const auto &childleveldata = patchdata.leveldata.at(level + 1);
+  const auto *const groupdata = childleveldata.groupdata.at(gi).get();
+  if (!groupdata)
+    return nullptr;
+  switch (kind) {
+  case band_kind::ks_source:
+    assert(stage >= 0 && stage < max_num_rk_stages);
+    return groupdata->ks_source_band[stage].get();
+  case band_kind::old_source:
+    return groupdata->old_source_band.get();
+  case band_kind::flux_register: {
+    // The child's flux register for the pair (level, level+1): six face
+    // FabSets on the coarsened fine BoxArray, i.e. in this level's index
+    // space like the bands above. Each face is a zero-ghost MultiFab, nodal
+    // in its own direction and cell-centred transversally.
+    assert(stage >= 0 && stage < 2 * dim);
+    if (!groupdata->freg)
+      return nullptr;
+    const int dir = stage / 2;
+    const amrex::Orientation::Side side =
+        stage % 2 ? amrex::Orientation::high : amrex::Orientation::low;
+    return &(*groupdata->freg)[amrex::Orientation(dir, side)].multiFab();
+  }
+  default:
+    assert(0);
+  }
+  return nullptr;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1310,7 +1362,7 @@ void SetupGlobals() {
     assert(group.dim <= dim);
 
     globaldata.arraygroupdata.at(gi) =
-        make_unique<GHExt::GlobalData::ArrayGroupData>();
+        std::make_unique<GHExt::GlobalData::ArrayGroupData>();
     GHExt::GlobalData::ArrayGroupData &arraygroupdata =
         *globaldata.arraygroupdata.at(gi);
     arraygroupdata.groupname = CCTK_FullGroupName(gi);
@@ -1350,9 +1402,6 @@ void SetupGlobals() {
     }
 
     // Allocate data
-    const nan_handling_t nan_handling = arraygroupdata.do_evolve
-                                            ? nan_handling_t::forbid_nans
-                                            : nan_handling_t::allow_nans;
     const int ntls = ghext->active_timelevels.at(gi);
     assert(ntls >= 0 and ntls <= group.numtimelevels);
     arraygroupdata.data.resize(ntls);
@@ -1374,8 +1423,7 @@ void SetupGlobals() {
         // TODO: make poison_invalid and check_invalid virtual members
         // of CommonGroupData
         poison_invalid_ga(gi, vi, tl);
-        check_valid_ga(gi, vi, tl, nan_handling,
-                       []() { return "SetupGlobals"; });
+        check_valid_ga(gi, vi, tl, []() { return "SetupGlobals"; });
       }
     }
   }
@@ -1397,6 +1445,7 @@ void CactusAmrCore::SetupLevel(const int level, const amrex::BoxArray &ba,
   if (level >= int(level_modified.size()))
     level_modified.resize(level + 1, true);
   level_modified.at(level) = true;
+  carpetx_epoch.fetch_add(1, std::memory_order_relaxed); // Increment epoch
   const active_levels_t active_levels(level, level + 1, patch, patch + 1);
 
   // Initialize data
@@ -1422,6 +1471,28 @@ void CactusAmrCore::SetupLevel(const int level, const amrex::BoxArray &ba,
     CCTK_VINFO("SetupLevel patch %d level %d done.", patch, level);
 }
 
+amrex::BoxArray CactusAmrCore::RechopLevel(const int level,
+                                           amrex::BoxArray ba) const {
+  if (level == 0)
+    // Level 0 always covers the full domain: regenerate the canonical
+    // cold-start decomposition (maxSize + optional ChopGrids over the whole
+    // domain). Independent of the checkpoint partition, so it yields larger OR
+    // smaller boxes purely as max_grid_size / NProcs dictate.
+    return MakeBaseGrids();
+
+  // Levels > 0: coalesce the checkpoint union into a (near-)minimal box set
+  // first, so re-chopping can MERGE into larger boxes on scale-down — not just
+  // split into smaller ones — then tile to max_grid_size and load-balance.
+  amrex::BoxList bl = ba.boxList();
+  while (bl.simplify()) // greedily merge abutting boxes to a fixpoint
+    ;
+  ba = amrex::BoxArray(std::move(bl));
+  ba.maxSize(maxGridSize(level)); // tile to current max_grid_size
+  if (refine_grid_layout)         // load-balance to current node count
+    ChopGrids(level, ba, amrex::ParallelDescriptor::NProcs());
+  return ba;
+}
+
 void CactusAmrCore::MakeNewLevelFromScratch(
     int level, amrex::Real time, const amrex::BoxArray &ba,
     const amrex::DistributionMapping &dm) {
@@ -1436,6 +1507,18 @@ void CactusAmrCore::MakeNewLevelFromScratch(
   if (verbose)
 #pragma omp critical
     CCTK_VINFO("MakeNewLevelFromScratch patch %d level %d done.", patch, level);
+}
+
+// How many time levels are transported onto a new/remade level at regrid time
+static int
+regrid_prolongate_tls(const GHExt::PatchData::LevelData::GroupData &groupdata) {
+  const int ntls = groupdata.mfab.size();
+  // Evolved state: all but the oldest time level (ntls == 1: that one),
+  // since CycleTimelevels invalidates the oldest anyway.
+  return groupdata.do_evolve ? (ntls > 1 ? ntls - 1 : ntls)
+         : groupdata.do_checkpoint
+             ? ntls // persistent non-evolved state: all TLs
+             : 0;   // recomputable scratch: nothing
 }
 
 void CactusAmrCore::MakeNewLevelFromCoarse(
@@ -1462,7 +1545,7 @@ void CactusAmrCore::MakeNewLevelFromCoarse(
   // only allow creation of new levels when the source and target are aligned
   // in time
   if (leveldata.iteration != coarseleveldata.iteration) {
-    ostringstream msg;
+    std::ostringstream msg;
     msg << "Coarse (rl=" << (level - 1) << ", it=" << coarseleveldata.iteration
         << ") and fine (rl=" << level << ", it=" << leveldata.iteration
         << ") grid do not align in time when regridding";
@@ -1485,57 +1568,77 @@ void CactusAmrCore::MakeNewLevelFromCoarse(
     amrex::Interpolater *const interpolator = groupdata.interpolator;
 
     const int ntls = groupdata.mfab.size();
-    // We only prolongate the state vector. And if there is more than
-    // one time level, then we don't prolongate the oldest.
-    const int prolongate_tl =
-        groupdata.do_evolve ? (ntls > 1 ? ntls - 1 : ntls) : 0;
-    const nan_handling_t nan_handling = groupdata.do_evolve
-                                            ? nan_handling_t::forbid_nans
-                                            : nan_handling_t::allow_nans;
+    const int prolongate_tl = regrid_prolongate_tls(groupdata);
 
     groupdata.valid.resize(ntls);
     for (int tl = 0; tl < ntls; ++tl) {
       why_valid_t why([]() { return "MakeNewLevelFromCoarse"; });
       groupdata.valid.at(tl).resize(groupdata.numvars, why);
-      for (int vi = 0; vi < groupdata.numvars; ++vi)
-        groupdata.valid.at(tl).at(vi).set_all(valid_t(false), []() {
-          return "MakeNewLevelFromCoarse: not prolongated because variable is "
-                 "not evolved";
-        });
+      for (int vi = 0; vi < groupdata.numvars; ++vi) {
+        // Time levels with tl < prolongate_tl are overwritten below after
+        // prolongation; these reasons persist only for the others
+        if (groupdata.do_evolve)
+          groupdata.valid.at(tl).at(vi).set_all(valid_t(false), []() {
+            return "MakeNewLevelFromCoarse: oldest time level is not "
+                   "prolongated at regrid";
+          });
+        else
+          groupdata.valid.at(tl).at(vi).set_all(valid_t(false), []() {
+            return "MakeNewLevelFromCoarse: not prolongated because variable "
+                   "is not evolved";
+          });
+      }
 
       if (tl < prolongate_tl) {
-        // Expect coarse grid data to be valid
-        for (int vi = 0; vi < groupdata.numvars; ++vi) {
-          error_if_invalid(coarsegroupdata, vi, tl, make_valid_all(), []() {
-            return "MakeNewLevelFromCoarse before prolongation";
-          });
-          check_valid_gf(active_coarse_levels, gi, vi, tl, nan_handling, []() {
-            return "MakeNewLevelFromCoarse before prolongation";
-          });
+        bool do_fill = true;
+        if (groupdata.do_evolve) {
+          // Expect coarse grid data to be valid
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            error_if_invalid(coarsegroupdata, vi, tl, make_valid_all(), []() {
+              return "MakeNewLevelFromCoarse before prolongation";
+            });
+        } else {
+          // Checkpointed non-evolved state: transport best-effort, only
+          // when the coarse source is fully valid
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            do_fill &= coarsegroupdata.valid.at(tl).at(vi).get().valid_all();
         }
-        FillPatch_NewLevel(
-            groupdata, coarsegroupdata, *groupdata.mfab.at(tl),
-            *coarsegroupdata.mfab.at(tl), patchdata.amrcore->Geom(level - 1),
-            patchdata.amrcore->Geom(level), interpolator, groupdata.bcrecs);
-        const auto outer_valid =
-            groupdata.all_faces_have_symmetries_or_boundaries()
-                ? make_valid_outer()
-                : valid_t();
-        for (int vi = 0; vi < groupdata.numvars; ++vi) {
-          groupdata.valid.at(tl).at(vi).set_all(
-              make_valid_int() | make_valid_ghosts() | outer_valid,
-              []() { return "MakeNewLevelFromCoarse after prolongation"; });
-          // This cannot be called because it would access the data
-          // with old metadata
-          // check_valid_gf(active_levels, gi, vi, tl, nan_handling, []() {
-          //   return "MakeNewLevelFromCoarse after prolongation";
-          // });
+        if (do_fill) {
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            check_valid_gf(active_coarse_levels, gi, vi, tl, []() {
+              return "MakeNewLevelFromCoarse before prolongation";
+            });
+          FillPatch_NewLevel(
+              groupdata, coarsegroupdata, *groupdata.mfab.at(tl),
+              *coarsegroupdata.mfab.at(tl), patchdata.amrcore->Geom(level - 1),
+              patchdata.amrcore->Geom(level), interpolator, groupdata.bcrecs);
+          const auto outer_valid =
+              groupdata.all_faces_have_symmetries_or_boundaries()
+                  ? make_valid_outer()
+                  : valid_t();
+          for (int vi = 0; vi < groupdata.numvars; ++vi) {
+            groupdata.valid.at(tl).at(vi).set_all(
+                make_valid_int() | make_valid_ghosts() | outer_valid,
+                []() { return "MakeNewLevelFromCoarse after prolongation"; });
+            // This cannot be called because it would access the data
+            // with old metadata
+            // check_valid_gf(active_levels, gi, vi, tl, []() {
+            //   return "MakeNewLevelFromCoarse after prolongation";
+            // });
+          }
+        } else {
+          // Data already poisoned by SetupLevel
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            groupdata.valid.at(tl).at(vi).set_all(valid_t(false), []() {
+              return "MakeNewLevelFromCoarse: not prolongated because source "
+                     "was invalid at regrid time";
+            });
         }
       }
 
       // Already poisoned by SetupLevel
       for (int vi = 0; vi < groupdata.numvars; ++vi)
-        check_valid_gf(active_levels, gi, vi, tl, nan_handling, []() {
+        check_valid_gf(active_levels, gi, vi, tl, []() {
           return "MakeNewLevelFromCoarse after prolongation";
         });
     } // for tl
@@ -1567,7 +1670,7 @@ void CactusAmrCore::RemakeLevel(const int level, const amrex::Real time,
   // only allow modfication of levels when the source and target are aligned in
   // time
   if (leveldata.iteration != coarseleveldata.iteration) {
-    ostringstream msg;
+    std::ostringstream msg;
     msg << "Coarse (rl=" << (level - 1) << ", it=" << coarseleveldata.iteration
         << ") and fine (rl=" << level << ", it=" << leveldata.iteration
         << ") grid do not align in time when regridding";
@@ -1590,27 +1693,23 @@ void CactusAmrCore::RemakeLevel(const int level, const amrex::Real time,
     assert(coarsegroupdata.numvars == groupdata.numvars);
 
     const int ntls = groupdata.mfab.size();
-    // We only prolongate the state vector. And if there is more than
-    // one time level, then we don't prolongate the oldest.
-    const int prolongate_tl =
-        groupdata.do_evolve ? (ntls > 1 ? ntls - 1 : ntls) : 0;
-    const nan_handling_t nan_handling = groupdata.do_evolve
-                                            ? nan_handling_t::forbid_nans
-                                            : nan_handling_t::allow_nans;
+    const int prolongate_tl = regrid_prolongate_tls(groupdata);
 
     for (int tl = 0; tl < ntls; ++tl) {
       for (int vi = 0; vi < groupdata.numvars; ++vi) {
         poison_invalid_gf(active_levels, gi, vi, tl);
 
-        if (tl < prolongate_tl) {
+        // Checkpointed non-evolved groups are transported best-effort;
+        // only evolved groups require valid sources here
+        if (groupdata.do_evolve && tl < prolongate_tl) {
           error_if_invalid(coarsegroupdata, vi, tl, make_valid_all(),
                            []() { return "RemakeLevel before prolongation"; });
           error_if_invalid(groupdata, vi, tl, make_valid_all(),
                            []() { return "RemakeLevel before prolongation"; });
         }
-        check_valid_gf(active_coarse_levels, gi, vi, tl, nan_handling,
+        check_valid_gf(active_coarse_levels, gi, vi, tl,
                        []() { return "RemakeLevel before prolongation"; });
-        check_valid_gf(active_levels, gi, vi, tl, nan_handling,
+        check_valid_gf(active_levels, gi, vi, tl,
                        []() { return "RemakeLevel before prolongation"; });
       } // for vi
     } // for tl
@@ -1621,7 +1720,7 @@ void CactusAmrCore::RemakeLevel(const int level, const amrex::Real time,
       ghost_size >= 0 ? ghost_size : ghost_size_x,
       ghost_size >= 0 ? ghost_size : ghost_size_y,
       ghost_size >= 0 ? ghost_size : ghost_size_z};
-  leveldata.fab = make_unique<amrex::FabArrayBase>(ba, dm, 1, nghostzones);
+  leveldata.fab = std::make_unique<amrex::FabArrayBase>(ba, dm, 1, nghostzones);
   assert(ba.ixType() == amrex::IndexType(amrex::IndexType::CELL,
                                          amrex::IndexType::CELL,
                                          amrex::IndexType::CELL));
@@ -1654,34 +1753,46 @@ void CactusAmrCore::RemakeLevel(const int level, const amrex::Real time,
                                  : valid_t();
     assert(outer_valid == make_valid_outer());
 
-    const nan_handling_t nan_handling = groupdata.do_evolve
-                                            ? nan_handling_t::forbid_nans
-                                            : nan_handling_t::allow_nans;
-
     const int ntls = groupdata.mfab.size();
-    // We only prolongate the state vector. And if there is more than
-    // one time level, then we don't prolongate the oldest.
-    const int prolongate_tl =
-        groupdata.do_evolve ? (ntls > 1 ? ntls - 1 : ntls) : 0;
+    const int prolongate_tl = regrid_prolongate_tls(groupdata);
 
     for (int tl = 0; tl < ntls; ++tl) {
       if (tl < prolongate_tl) {
-        // Copy from same level and/or prolongate from next coarser level
-        FillPatch_RemakeLevel(
-            groupdata, coarsegroupdata, *groupdata.mfab.at(tl),
-            *coarsegroupdata.mfab.at(tl), *oldgroupdata.mfab.at(tl),
-            patchdata.amrcore->Geom(level - 1), patchdata.amrcore->Geom(level),
-            interpolator, groupdata.bcrecs);
+        // Checkpointed non-evolved state: transport best-effort, only when
+        // both the coarse and the old fine sources are fully valid
+        // (oldgroupdata.valid still carries the pre-swap flags)
+        bool do_fill = true;
+        if (!groupdata.do_evolve)
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            do_fill &= coarsegroupdata.valid.at(tl).at(vi).get().valid_all() &&
+                       oldgroupdata.valid.at(tl).at(vi).get().valid_all();
 
-        for (int vi = 0; vi < groupdata.numvars; ++vi)
-          groupdata.valid.at(tl).at(vi) =
-              why_valid_t(make_valid_int() | make_valid_ghosts() | outer_valid,
-                          []() { return "RemakeLevel after prolongation"; });
+        if (do_fill) {
+          // Copy from same level and/or prolongate from next coarser level
+          FillPatch_RemakeLevel(
+              groupdata, coarsegroupdata, *groupdata.mfab.at(tl),
+              *coarsegroupdata.mfab.at(tl), *oldgroupdata.mfab.at(tl),
+              patchdata.amrcore->Geom(level - 1),
+              patchdata.amrcore->Geom(level), interpolator, groupdata.bcrecs);
+
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            groupdata.valid.at(tl).at(vi) = why_valid_t(
+                make_valid_int() | make_valid_ghosts() | outer_valid,
+                []() { return "RemakeLevel after prolongation"; });
+        } else {
+          // Leave the constructor-default invalid state; the data is
+          // poisoned below
+          for (int vi = 0; vi < groupdata.numvars; ++vi)
+            groupdata.valid.at(tl).at(vi).set_all(valid_t(false), []() {
+              return "RemakeLevel: not prolongated because source was "
+                     "invalid at regrid time";
+            });
+        }
       }
 
       for (int vi = 0; vi < groupdata.numvars; ++vi) {
         poison_invalid_gf(active_levels, gi, vi, tl);
-        check_valid_gf(active_levels, gi, vi, tl, nan_handling,
+        check_valid_gf(active_levels, gi, vi, tl,
                        []() { return "RemakeLevel after prolongation"; });
       }
     } // for tl
@@ -1689,6 +1800,7 @@ void CactusAmrCore::RemakeLevel(const int level, const amrex::Real time,
   } // for gi
 
   level_modified.at(level) = true;
+  carpetx_epoch.fetch_add(1, std::memory_order_relaxed); // Increment epoch
 
   if (verbose)
 #pragma omp critical
@@ -1706,6 +1818,7 @@ void CactusAmrCore::ClearLevel(const int level) {
   leveldata.erase(leveldata.begin() + level, leveldata.end());
 
   level_modified.resize(level);
+  carpetx_epoch.fetch_add(1, std::memory_order_relaxed); // Increment epoch
 
   if (verbose)
 #pragma omp critical
@@ -2024,7 +2137,7 @@ extern "C" int CarpetX_Startup() {
     CCTK_VINFO("Startup");
 
   // Output a startup message
-  const vector<string> features{
+  const std::vector<std::string> features{
 #ifdef AMREX_USE_MPI
       "MPI",
 #else
@@ -2203,7 +2316,7 @@ void *SetupGH(tFleshConfig *fc, int convLevel, cGH *restrict cctkGH) {
   }
 
   // Create grid structure
-  ghext = make_unique<GHExt>();
+  ghext = std::make_unique<GHExt>();
 
   // Initialize the STORAGE registry. It is populated from schedule.ccl by
   // CCTKi_ScheduleGHInit (which calls back into our GroupStorageIncrease
@@ -2237,6 +2350,11 @@ int InitGH(cGH *restrict cctkGH) {
 
   // Set up use_subcycling
   ghext->use_subcycling = use_subcycling;
+  // Cache do_reflux here, once: DECLARE_CCTK_PARAMETERS in the GroupData
+  // constructor would shadow its do_restrict member, so the constructor (and
+  // AccumulateFluxes, Reflux) read ghext->do_reflux instead. Recovery
+  // restores the parameter from the checkpoint before InitGH runs.
+  ghext->do_reflux = do_reflux;
 
   return 0; // unused
 }
@@ -2339,14 +2457,8 @@ int Barrier(const cGH *restrict cctkGH) {
 void CarpetX_CallScheduleGroup(void *cctkGH_, const char *groupname) {
   cGH *cctkGH = static_cast<cGH *>(cctkGH_);
   static Timer timer("CallScheduleGroup");
-  static thread_local int schedule_group_depth = 0;
-  const bool outermost = schedule_group_depth++ == 0;
-  if (outermost)
-    timer.start();
+  Interval interval(timer);
   int ierr = CCTK_ScheduleTraverse(groupname, cctkGH, CallFunction);
-  if (outermost)
-    timer.stop();
-  --schedule_group_depth;
   assert(!ierr);
 }
 

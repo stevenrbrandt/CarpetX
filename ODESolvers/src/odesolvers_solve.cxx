@@ -1,4 +1,9 @@
+#include "rk_methods.hxx"
 #include "solve.hxx"
+
+// Driver flux-register primitives (AccumulateFluxes, Reflux).
+// TODO: Don't include files from other thorns; create a proper interface.
+#include "../../CarpetX/src/subcycling.hxx"
 
 namespace ODESolvers {
 using namespace std;
@@ -9,11 +14,41 @@ extern "C" void ODESolvers_InitConstants(CCTK_ARGUMENTS) {
 
   *do_substeps = 0;
 
-  // Publish the active RK stage count for the subcycling band machinery
-  // (read by CarpetX::build_bands and the recovery path).
-  CarpetX::ghext->num_rk_stages =
-      (CCTK_EQUALS(method, "SSPRK3") || CCTK_EQUALS(method, "IMEX32L")) ? 3
-                                                                        : 4;
+  // Publish the method's stage count (rk_methods.hxx) for the driver: the
+  // subcycling band machinery (CarpetX::EnsureRKBuffers, the recovery path)
+  // and the stage bound CarpetX::AccumulateFluxes asserts.
+  CarpetX::ghext->num_rk_stages = rk_method(method).nstages;
+
+  // Publish the groups we integrate, i.e. the var_groups the solvers collect:
+  // grid functions that declare a RHS. Only these own subcycling source bands,
+  // and recovery must rebuild bands for exactly these groups.
+  std::vector<bool> &integrated = CarpetX::ghext->rk_integrated_group;
+  integrated.assign(CCTK_NumGroups(), false);
+  for (int gi = 0; gi < CCTK_NumGroups(); ++gi)
+    // TODO: add support for evolving grid scalars
+    integrated.at(gi) =
+        CCTK_GroupTypeI(gi) == CCTK_GF && get_group_rhs(gi) >= 0;
+}
+
+// Reject at PARAMCHECK any group we integrate that is not evolved
+// (evolve="no", or checkpoint="no" without an evolve tag). Regrid keeps no
+// timelevel of a non-evolved, non-checkpointed group and fills a non-evolved
+// checkpointed one only best effort, so the state would be lost or left
+// invalid; under subcycling the dense-output fill of the coarse-fine ghosts
+// also assumes an evolved group. Unconditional: with or without subcycling,
+// on any number of levels. Runs after WRAGH, where ODESolvers_InitConstants
+// publishes rk_integrated_group, so CarpetX::group_is_integrated is final.
+extern "C" void ODESolvers_CheckEvolved(CCTK_ARGUMENTS) {
+  DECLARE_CCTK_ARGUMENTS_ODESolvers_CheckEvolved;
+
+  for (int gi = 0; gi < CCTK_NumGroups(); ++gi)
+    if (CarpetX::group_is_integrated(gi) && !CarpetX::get_group_evolve_flag(gi))
+      CCTK_VERROR("Group \"%s\" is integrated by ODESolvers (rhs= tag) but "
+                  "not evolved (evolve=\"no\", or checkpoint=\"no\" without "
+                  "an evolve tag). Regrid would drop or not refill its state. "
+                  "Remove evolve=\"no\" / checkpoint=\"no\", or set "
+                  "evolve=\"yes\".",
+                  CCTK_FullGroupName(gi));
 }
 
 extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
@@ -116,16 +151,36 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
   static Timer timer_rhs("ODESolvers::Solve::rhs");
   static Timer timer_poststep("ODESolvers::Solve::poststep");
 
+  // The method's row in the RK method table (rk_methods.hxx): its stage
+  // count, at which the step is complete, and the effective weight b_s of
+  // each stage in the final update,
+  //   y1 = y0 + dt * sum_s b_s f(Y_s),
+  // handed to the driver's flux registers so that after a full step they
+  // hold exactly the flux combination the state received. RKF78 and DP87
+  // take their b from their local tableaus below instead.
+  const rk_method_t &rk = rk_method(method);
+
   const auto copy_state = [](const auto &var, const valid_t where) {
     return var.copy(where);
   };
-  const auto calcrhs = [&](const int n) {
+  // Evaluate the RHS of stage n, whose effective weight in the final update
+  // is b_n
+  const auto calcrhs = [&](const int n, const CCTK_REAL b_n) {
     Interval interval_rhs(timer_rhs);
     if (verbose)
       CCTK_VINFO("Calculating RHS #%d at t=%g", n, double(cctkGH->cctk_time));
     CallScheduleGroup(cctkGH, "ODESolvers_RHS");
     rhs.check_valid(make_valid_int(),
                     "ODESolvers after calling ODESolvers_RHS");
+    // Feed the driver's flux registers with this stage's flux, weighted by
+    // the stage's effective weight and the step, now: the flux groups hold
+    // exactly the flux the update below consumes, and calcupdate marks them
+    // invalid afterwards (they are dependents of the state). No-op without
+    // registers (no fluxes= tag, or do_reflux = no).
+    active_levels->loop_coarse_to_fine([&](const auto &restrict leveldata) {
+      CarpetX::AccumulateFluxes(leveldata.patch, leveldata.level, n, b_n * dt);
+    });
+    synchronize();
   };
   const auto calcimplicitrhs = [&](const int n) {
     Interval interval_rhs(timer_rhs);
@@ -168,6 +223,16 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
                       "ODESolvers after defining new state vector");
       mark_invalid(dep_groups);
     }
+    if (n == rk.nstages) {
+      // The step is complete on every level (no subcycling: all levels
+      // share one dt): apply every pair's register to its coarse level
+      // before the PostStep below re-syncs ghosts (and, with
+      // restrict_during_sync, restricts), re-applies boundary conditions
+      // and recomputes the dependents of the corrected cells.
+      static Timer timer_reflux("ODESolvers::Solve::reflux");
+      Interval interval_reflux(timer_reflux);
+      CarpetX::Reflux(cctkGH, 0, CarpetX::ghext->num_levels());
+    }
     {
       Interval interval_poststep(timer_poststep);
       *const_cast<CCTK_REAL *>(&cctkGH->cctk_time) = old_time + c;
@@ -175,7 +240,7 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       if (verbose)
         CCTK_VINFO("Calculated new state #%d at t=%g", n,
                    double(cctkGH->cctk_time));
-    }
+      }
   };
 
   const auto run_imex =
@@ -183,6 +248,7 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
           const vector<vector<CCTK_REAL> > &a_imp,
           const vector<CCTK_REAL> &b_exp, const vector<CCTK_REAL> &b_imp) {
         const int nstages = cs.size();
+        assert(nstages == rk.nstages);
         assert(int(a_exp.size()) == nstages);
         assert(int(a_imp.size()) == nstages);
         assert(int(b_exp.size()) == nstages);
@@ -220,29 +286,24 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
         };
 
         for (int stage = 0; stage < nstages; ++stage) {
-          if (stage == 0) {
-            *const_cast<CCTK_REAL *>(&cctkGH->cctk_time) = old_time;
-          } else {
+          if (stage > 0) {
             define_stage_base(stage);
             calcpreimplicit();
           }
 
           const CCTK_REAL diag = a_imp.at(stage).at(stage);
+          statecomp_t g;
           if (diag == 0) {
             calcimplicitrhs(stage + 1);
             CallScheduleGroup(cctkGH, "ODESolvers_AfterImplicitRHS");
-            gks.push_back(copy_state(rhs, make_valid_int()));
+            g = copy_state(rhs, make_valid_int());
           } else {
-            // Scratch copies share the evolved group's validity metadata.
-            // Preserve the stage ghost validity while retaining the
-            // pre-implicit interior used to recover g(Y_i).
             const auto base = copy_state(var, make_valid_all());
             calcimplicitstep(stage + 1, diag * dt);
-            CallScheduleGroup(cctkGH, "ODESolvers_PostStep");
 
-            // Use the update accepted by the diagonal solver as the effective
-            // implicit operator. This remains consistent when that solver
-            // applies a limiter, floor, or realizability repair.
+            // The effective implicit operator is the diagonal solve itself.
+            // Numerical projections performed by PostStep must not enter the
+            // additive Runge-Kutta tableau.
             statecomp_t::lincomb(
                 rhs, 0.0,
                 vector<CCTK_REAL>{1.0 / (diag * dt), -1.0 / (diag * dt)},
@@ -250,11 +311,16 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
             rhs.check_valid(make_valid_int(),
                             "ODESolvers effective implicit RHS");
             CallScheduleGroup(cctkGH, "ODESolvers_AfterImplicitRHS");
-            gks.push_back(copy_state(rhs, make_valid_int()));
+            g = copy_state(rhs, make_valid_int());
+
+            // Refresh derived variables and apply stage projections before
+            // evaluating the explicit operator at the stage state.
+            CallScheduleGroup(cctkGH, "ODESolvers_PostStep");
           }
 
-          calcrhs(stage + 1);
+          calcrhs(stage + 1, b_exp.at(stage));
           fks.push_back(copy_state(rhs, make_valid_int()));
+          gks.push_back(std::move(g));
         }
 
         vector<CCTK_REAL> factors;
@@ -277,6 +343,8 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
         var.check_valid(make_valid_int(),
                         "ODESolvers after defining IMEX final state");
         mark_invalid(dep_groups);
+
+        CarpetX::Reflux(cctkGH, 0, CarpetX::ghext->num_levels());
         *const_cast<CCTK_REAL *>(&cctkGH->cctk_time) = old_time + dt;
         CallScheduleGroup(cctkGH, "ODESolvers_PostStep");
       };
@@ -294,7 +362,9 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     // k1 = f(y0)
     // y1 = y0 + h k1
 
-    calcrhs(1);
+    assert(rk.nstages == 1);
+
+    calcrhs(1, rk.b.at(0));
     calcupdate(1, dt, 1.0, reals<1>{dt}, states<1>{&rhs});
 
   } else if (CCTK_EQUALS(method, "RK2")) {
@@ -303,12 +373,14 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     // k2 = f(y0 + h/2 k1)
     // y1 = y0 + h k2
 
+    assert(rk.nstages == 2);
+
     const auto old = copy_state(var, make_valid_all());
 
-    calcrhs(1);
+    calcrhs(1, rk.b.at(0));
     calcupdate(1, dt / 2, 1.0, reals<1>{dt / 2}, states<1>{&rhs});
 
-    calcrhs(2);
+    calcrhs(2, rk.b.at(1));
     calcupdate(2, dt, 0.0, reals<2>{1.0, dt}, states<2>{&old, &rhs});
 
   } else if (CCTK_EQUALS(method, "RK3")) {
@@ -318,44 +390,48 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     // k3 = f(y0 - h k1 + 2 h k2)
     // y1 = y0 + h/6 k1 + 2/3 h k2 + h/6 k3
 
+    assert(rk.nstages == 3);
+
     const auto old = copy_state(var, make_valid_all());
 
-    calcrhs(1);
+    calcrhs(1, rk.b.at(0));
     const auto k1 = copy_state(rhs, make_valid_int());
     calcupdate(1, dt / 2, 1.0, reals<1>{dt / 2}, states<1>{&k1});
 
-    calcrhs(2);
+    calcrhs(2, rk.b.at(1));
     const auto k2 = copy_state(rhs, make_valid_int());
     calcupdate(2, dt, 0.0, reals<3>{1.0, -dt, 2 * dt},
                states<3>{&old, &k1, &k2});
 
-    calcrhs(3);
+    calcrhs(3, rk.b.at(2));
     calcupdate(3, dt, 0.0, reals<4>{1.0, dt / 6, 2 * dt / 3, dt / 6},
                states<4>{&old, &k1, &k2, &rhs});
 
   } else if (CCTK_EQUALS(method, "SSPRK3")) {
 
-    // k1 = f(y0)
-    // k2 = f(y0 + h k1)
-    // k3 = f(y0 + h/4 k1 + h/4 k2)
-    // y1 = y0 + h/6 k1 + h/6 k2 + 2/3 h k3
+    // Low-storage Shu-Osher form (Shu & Osher 1988):
+    //   u1 = u0 + h L(u0)
+    //   u2 = 3/4 u0 + 1/4 u1 + 1/4 h L(u1)
+    //   u3 = 1/3 u0 + 2/3 u2 + 2/3 h L(u2)
+    // i.e. y1 = y0 + h/6 L(u0) + h/6 L(u1) + 2/3 h L(u2)
+
+    assert(rk.nstages == 3);
 
     const auto old = copy_state(var, make_valid_all());
 
-    calcrhs(1);
-    const auto k1 = copy_state(rhs, make_valid_int());
-    calcupdate(1, dt, 1.0, reals<1>{dt}, states<1>{&k1});
+    calcrhs(1, rk.b.at(0));
+    calcupdate(1, dt, 1.0, reals<1>{dt}, states<1>{&rhs});
 
-    calcrhs(2);
-    const auto k2 = copy_state(rhs, make_valid_int());
-    calcupdate(2, dt / 2, 0.0, reals<3>{1.0, dt / 4, dt / 4},
-               states<3>{&old, &k1, &k2});
+    calcrhs(2, rk.b.at(1));
+    calcupdate(2, dt / 2, 1.0 / 4.0, reals<2>{3.0 / 4.0, dt / 4},
+               states<2>{&old, &rhs});
 
-    calcrhs(3);
-    calcupdate(3, dt, 0.0, reals<4>{1.0, dt / 6, dt / 6, 2 * dt / 3},
-               states<4>{&old, &k1, &k2, &rhs});
+    calcrhs(3, rk.b.at(2));
+    calcupdate(3, dt, 2.0 / 3.0, reals<2>{1.0 / 3.0, 2 * dt / 3},
+               states<2>{&old, &rhs});
 
-  } else if (CCTK_EQUALS(method, "RK4")) {
+  } else if (CCTK_EQUALS(method, "RK4") ||
+             CCTK_EQUALS(method, "semi-implicit")) {
 
     // k1 = f(y0)
     // k2 = f(y0 + h/2 k1)
@@ -363,13 +439,15 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     // k4 = f(y0 + h k3)
     // y1 = y0 + h/6 k1 + h/3 k2 + h/3 k3 + h/6 k4
 
+    assert(rk.nstages == 4);
+
     const auto old = copy_state(var, make_valid_all());
 
-    calcrhs(1);
+    calcrhs(1, rk.b.at(0));
     const auto kaccum = copy_state(rhs, make_valid_int());
     calcupdate(1, dt / 2, 1.0, reals<1>{dt / 2}, states<1>{&kaccum});
 
-    calcrhs(2);
+    calcrhs(2, rk.b.at(1));
     {
       Interval interval_lincomb(timer_lincomb);
       statecomp_t::lincomb(kaccum, 1.0, reals<1>{2.0}, states<1>{&rhs},
@@ -377,7 +455,7 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     }
     calcupdate(2, dt / 2, 0.0, reals<2>{1.0, dt / 2}, states<2>{&old, &rhs});
 
-    calcrhs(3);
+    calcrhs(3, rk.b.at(2));
     {
       Interval interval_lincomb(timer_lincomb);
       statecomp_t::lincomb(kaccum, 1.0, reals<1>{2.0}, states<1>{&rhs},
@@ -385,9 +463,14 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     }
     calcupdate(3, dt, 0.0, reals<2>{1.0, dt}, states<2>{&old, &rhs});
 
-    calcrhs(4);
+    calcrhs(4, rk.b.at(3));
     calcupdate(4, dt, 0.0, reals<3>{1.0, dt / 6, dt / 6},
                states<3>{&old, &kaccum, &rhs});
+
+    if (CCTK_EQUALS(method, "semi-implicit")) {
+      calcimplicitstep(1, dt);
+      CallScheduleGroup(cctkGH, "ODESolvers_PostStep");
+    }
 
   } else if (CCTK_EQUALS(method, "RKF78")) {
 
@@ -439,6 +522,8 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
 
     // Check Butcher tableau
     const size_t nsteps = get<0>(tableau).size();
+    // The stage count published from the method table must be this tableau's
+    assert(int(nsteps) == rk_method(method).nstages);
     {
       for (size_t step = 0; step < nsteps; ++step) {
         // TODO: Could allow <=
@@ -460,6 +545,10 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     }
 
     const auto old = copy_state(var, make_valid_all());
+
+    // Final-update weights: this tableau's b, not the method table's row
+    // (rk_methods.hxx), which has no room for this many stages
+    const auto &bs = get<1>(tableau);
 
     vector<statecomp_t> ks;
     ks.reserve(nsteps);
@@ -486,12 +575,11 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
         // TODO: Deallocate ks that are not needed any more
       }
 
-      calcrhs(step + 1);
+      calcrhs(step + 1, bs.at(step));
       ks.push_back(copy_state(rhs, make_valid_int()));
     }
 
     // Calculate new state vector
-    const auto &bs = get<1>(tableau);
     vector<CCTK_REAL> factors;
     vector<const statecomp_t *> srcs;
     factors.reserve(bs.size() + 1);
@@ -556,6 +644,8 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
 
     // Check Butcher tableau
     const size_t nsteps = get<0>(tableau).size();
+    // The stage count published from the method table must be this tableau's
+    assert(int(nsteps) == rk_method(method).nstages);
     {
       for (size_t step = 0; step < nsteps; ++step)
         // TODO: Could allow <=
@@ -570,6 +660,10 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     }
 
     const auto old = copy_state(var, make_valid_all());
+
+    // Final-update weights: this tableau's b, not the method table's row
+    // (rk_methods.hxx), which has no room for this many stages
+    const auto &bs = get<1>(tableau);
 
     vector<statecomp_t> ks;
     ks.reserve(nsteps);
@@ -598,12 +692,11 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
         // TODO: Deallocate ks that are not needed any more
       }
 
-      calcrhs(step + 1);
+      calcrhs(step + 1, bs.at(step));
       ks.push_back(copy_state(rhs, make_valid_int()));
     }
 
     // Calculate new state vector
-    const auto &bs = get<1>(tableau);
     vector<CCTK_REAL> factors;
     vector<const statecomp_t *> srcs;
     factors.reserve(bs.size() + 1);

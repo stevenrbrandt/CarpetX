@@ -8,6 +8,7 @@
 #include "io_slice.hxx"
 #include "io_tsv.hxx"
 #include "schedule.hxx"
+#include "subcycling.hxx"
 #include "timer.hxx"
 
 #include <CactusBase/IOUtil/src/ioGH.h>
@@ -15,6 +16,7 @@
 
 #include <cctk.h>
 #include <cctk_Arguments.h>
+#include <cctk_IOMethods.h>
 #include <cctk_Parameters.h>
 #include <util_Table.h>
 
@@ -26,7 +28,9 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <regex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -148,6 +152,11 @@ void RecoverGridStructure(cGH *restrict cctkGH) {
   DECLARE_CCTK_ARGUMENTS;
   DECLARE_CCTK_PARAMETERS;
 
+  if (rechop_on_recovery && !CCTK_EQUALS(recover_method, "openpmd"))
+    CCTK_VERROR("CarpetX::rechop_on_recovery is only supported for "
+                "recover_method=\"openpmd\" (got \"%s\")",
+                recover_method);
+
   if (CCTK_EQUALS(recover_method, "openpmd")) {
 
 #ifdef HAVE_CAPABILITY_openPMD_api
@@ -213,20 +222,27 @@ void RecoverGH(const cGH *restrict cctkGH) {
     return enabled;
   }();
 
-  // Rebuild the consumer-band geometry (deterministic, not serialized) so the
-  // band read below has somewhere to land. All levels exist here, so source
-  // geometry (reads level+1) is valid; build_bands is a no-op for non-evolved
-  // groups.
+  // Rebuild the source bands, each on its group's own geometry
+  // (deterministic, not serialized: a function of the refined level's layout
+  // and the group's interpolator and ghost width), so the band read below has
+  // somewhere to land. The refined level owns the bands of the step its parent
+  // takes, so there is nothing to allocate on level 0; EnsureRKBuffers is a
+  // no-op for groups the time integrator does not advance (the evolution never
+  // fills or writes their bands) and where the coarse-fine footprint is empty.
+  // Single-threaded: it warms AMReX's FPinfo cache.
   if (ghext->use_subcycling) {
     for (const auto &patchdata : ghext->patchdata)
-      for (const auto &leveldata : patchdata.leveldata)
+      for (const auto &leveldata : patchdata.leveldata) {
+        if (leveldata.level == 0)
+          continue;
         for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
           if (CCTK_GroupTypeI(gi) != CCTK_GF)
             continue;
           const auto *const gd = leveldata.groupdata.at(gi).get();
           if (gd)
-            leveldata.build_bands(*gd);
+            EnsureRKBuffers(leveldata.patch, leveldata.level, gi);
         }
+      }
   }
 
   if (CCTK_EQUALS(recover_method, "openpmd")) {
@@ -253,6 +269,9 @@ void RecoverGH(const cGH *restrict cctkGH) {
   } else {
     CCTK_ERROR("unknown value for paramater CarpetX::recover_method");
   }
+
+  // Increment epoch
+  carpetx_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void InputGH(const cGH *restrict cctkGH) {
@@ -345,7 +364,7 @@ void OutputPlotfile(const cGH *restrict cctkGH) {
       const int tl = 0;
 
       std::string groupname = CCTK_FullGroupName(gi);
-      groupname = regex_replace(groupname, regex("::"), "-");
+      groupname = regex_replace(groupname, std::regex("::"), "-");
       for (auto &c : groupname)
         c = tolower(c);
 
@@ -353,10 +372,10 @@ void OutputPlotfile(const cGH *restrict cctkGH) {
 
         const std::string basename = [&]() {
           std::ostringstream buf;
-          buf << groupname << ".it" << setw(8) << setfill('0')
+          buf << groupname << ".it" << std::setw(8) << std::setfill('0')
               << cctk_iteration;
           if (ghext->num_patches() > 1)
-            buf << ".m" << setw(2) << setfill('0') << patchdata.patch;
+            buf << ".m" << std::setw(2) << std::setfill('0') << patchdata.patch;
           return buf.str();
         }();
         const std::string filename = std::string(out_dir) + "/" + basename;
@@ -393,7 +412,7 @@ void OutputPlotfile(const cGH *restrict cctkGH) {
             buf << out_dir << "/" << groupname << ".visit";
             return buf.str();
           }();
-          std::ofstream visit(visitname, ios::app);
+          std::ofstream visit(visitname, std::ios::app);
           assert(visit.good());
           visit << basename << "/Header\n";
           visit.close();
@@ -512,7 +531,8 @@ void OutputMetadata(const cGH *restrict cctkGH) {
 
     std::ostringstream buf;
     buf << out_dir << "/carpetx-metadata"
-        << ".it" << setw(8) << setfill('0') << cctk_iteration << ".yaml";
+        << ".it" << std::setw(8) << std::setfill('0') << cctk_iteration
+        << ".yaml";
     const std::string filename = buf.str();
     std::ofstream file(filename.c_str(), std::ofstream::out);
     file << yaml.c_str();
@@ -527,7 +547,8 @@ void OutputMetadata(const cGH *restrict cctkGH) {
 
     std::ostringstream buf;
     buf << out_dir << "/parameters"
-        << ".it" << setw(8) << setfill('0') << cctk_iteration << ".yaml";
+        << ".it" << std::setw(8) << std::setfill('0') << cctk_iteration
+        << ".yaml";
     const std::string filename = buf.str();
     std::ofstream file(filename.c_str(), std::ofstream::out);
     file << yaml.c_str();
@@ -671,6 +692,17 @@ int OutputGH(const cGH *restrict cctkGH) {
       OutputTSV(cctkGH);
   }
 
+  // Call the IO methods registered via CCTK_RegisterIOMethod; the flesh's
+  // default traversal never runs since CCTK_OutputGH is overloaded.
+  {
+    const int num_methods = CCTK_NumIOMethods();
+    for (int handle = 0; handle < num_methods; ++handle) {
+      const IOMethod *const method = CCTK_IOMethod(handle);
+      if (method && method->OutputGH)
+        method->OutputGH(cctkGH);
+    }
+  }
+
   // Describe all output files
   OutputMeta(cctkGH);
 
@@ -778,7 +810,67 @@ void Checkpoint(const cGH *const restrict cctkGH) {
   }
 }
 
-int last_checkpoint_runtime = -1; // seconds
+namespace {
+
+// Trigger state for `IO::checkpoint_every_walltime_hours`.
+//
+// Every checkpoint trigger mechanism is independent: it consults only its own
+// state, never checkpoints written by the other mechanisms.
+//
+// This is the run time (seconds since the start of this run) at which the
+// walltime trigger last fired; 0 means it has not fired yet. It is advanced
+// whenever the trigger fires, even if the resulting checkpoint is then skipped
+// because one had already been written for this iteration.
+int last_walltime_trigger_runtime = 0; // seconds
+
+// Whether the walltime criterion `IO::checkpoint_every_walltime_hours` is met
+// at run time `runtime` (seconds since the start of this run), advancing the
+// trigger's state when it is.
+//
+// The criterion is anchored to the start of the run, not to the previous
+// checkpoint: slot boundaries lie at run times N, 2N, 3N, ... for an interval
+// of N seconds, and the trigger fires at the first evaluation point that falls
+// into a later slot than the previous firing did. The long-term rate is thus
+// exactly one checkpoint per N, with no drift accumulating from the delay
+// between a boundary and the next evaluation point.
+//
+// When a single time step spans several slots, the state snaps to the current
+// slot instead of advancing one slot at a time, so that the slots skipped over
+// do not make the trigger fire again on the following time steps.
+//
+// Both callers are scheduled with `OPTIONS: meta`, so this runs once per
+// iteration. It must be called on every process with the same `runtime`, since
+// it mutates state and decides whether a collective operation happens.
+bool CheckWalltimeTrigger(const int runtime) {
+  DECLARE_CCTK_PARAMETERS;
+
+  if (!(checkpoint_every_walltime_hours > 0))
+    return false;
+  // Round to whole seconds, the resolution of `CCTK_RunTime`, but keep the
+  // interval positive so that the slot arithmetic below is well defined
+  const int interval =
+      std::max(int(lrint(checkpoint_every_walltime_hours * 3600)), 1);
+  if (runtime / interval <= last_walltime_trigger_runtime / interval)
+    return false;
+  last_walltime_trigger_runtime = runtime;
+  return true;
+}
+
+// Name the triggers that fired, for the log message
+std::string DescribeTriggers(const char *const name1, const bool fired1,
+                             const char *const name2, const bool fired2) {
+  std::string description;
+  if (fired1)
+    description += name1;
+  if (fired2) {
+    if (!description.empty())
+      description += ", ";
+    description += name2;
+  }
+  return description;
+}
+
+} // namespace
 
 extern "C" void CarpetX_CheckpointInitial(CCTK_ARGUMENTS) {
   DECLARE_CCTK_ARGUMENTS;
@@ -787,12 +879,19 @@ extern "C" void CarpetX_CheckpointInitial(CCTK_ARGUMENTS) {
   int runtime = CCTK_RunTime(); // seconds
   MPI_Bcast(&runtime, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-  if (checkpoint_ID) {
+  // Setting up initial conditions can take a long time, so the walltime
+  // criterion is evaluated here as well and not only during the evolution
+  const bool checkpoint_by_walltime = CheckWalltimeTrigger(runtime);
+
+  if (checkpoint_ID || checkpoint_by_walltime) {
     CCTK_VINFO("Checkpointing initial conditions at iteration %d, time %f, run "
-               "time %.2f h",
-               cctk_iteration, double(cctk_time), double(runtime / 3600.0));
+               "time %.2f h (triggered by %s)",
+               cctk_iteration, double(cctk_time), double(runtime / 3600.0),
+               DescribeTriggers("checkpoint_ID", checkpoint_ID,
+                                "checkpoint_every_walltime_hours",
+                                checkpoint_by_walltime)
+                   .c_str());
     Checkpoint(cctkGH);
-    last_checkpoint_runtime = runtime;
   }
 }
 
@@ -805,16 +904,17 @@ extern "C" void CarpetX_Checkpoint(CCTK_ARGUMENTS) {
 
   const bool checkpoint_by_iteration =
       checkpoint_every > 0 && cctk_iteration % checkpoint_every == 0;
-  const bool checkpoint_by_walltime =
-      checkpoint_every_walltime_hours > 0 &&
-      runtime >= last_checkpoint_runtime +
-                     lrint(checkpoint_every_walltime_hours * 3600);
+  const bool checkpoint_by_walltime = CheckWalltimeTrigger(runtime);
 
   if (checkpoint_by_iteration || checkpoint_by_walltime) {
-    CCTK_VINFO("Checkpointing at iteration %d, time %f, run time %.2f h",
-               cctk_iteration, double(cctk_time), double(runtime / 3600.0));
+    CCTK_VINFO("Checkpointing at iteration %d, time %f, run time %.2f h "
+               "(triggered by %s)",
+               cctk_iteration, double(cctk_time), double(runtime / 3600.0),
+               DescribeTriggers("checkpoint_every", checkpoint_by_iteration,
+                                "checkpoint_every_walltime_hours",
+                                checkpoint_by_walltime)
+                   .c_str());
     Checkpoint(cctkGH);
-    last_checkpoint_runtime = runtime;
   }
 }
 

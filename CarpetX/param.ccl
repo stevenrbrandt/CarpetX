@@ -375,6 +375,10 @@ BOOLEAN refine_grid_layout "Ensure that each MPI process has at least one grid" 
 {
 } yes
 
+BOOLEAN rechop_on_recovery "Re-chop and load-balance the grid to the current max_grid_size / node count when recovering from a checkpoint (openPMD only)" STEERABLE=recover
+{
+} no
+
 CCTK_INT max_tile_size_x "Maximum tile size" STEERABLE=recover
 {
   1:* :: ""
@@ -467,9 +471,9 @@ CCTK_INT interpolation_order "Interpolation order" STEERABLE=always
 
 
 
-BOOLEAN do_reflux "Manage flux registers to ensure conservation"
+BOOLEAN do_reflux "Flux-register (reflux) correction for grid function groups with a fluxes= tag that ODESolvers integrates (groups with an rhs= tag; the tag then promises that the fluxes are computed in ODESolvers_RHS, and on any other group it is inert; with max_num_levels > 1 a warning is printed at startup for each such group). ODESolvers accumulates each level's stage-weighted fluxes into a register per level pair at every RK stage, with and without subcycling. Under subcycling the driver applies the correction to the coarse level once per coarse step, after CarpetX_PreRestrict and before restriction; without subcycling ODESolvers applies it at the end of every step, before the final ODESolvers_PostStep, under either setting of restrict_during_sync. Requires an explicit ODESolvers::method when an integrated group carries a fluxes= tag and max_num_levels > 1 (checked at PARAMCHECK). Off by default, so that codes whose groups carry fluxes= tags keep their behaviour until they opt in; a run with max_num_levels > 1 and such a group then prints one INFO line at startup."
 {
-} yes
+} no
 
 
 
@@ -539,6 +543,10 @@ KEYWORD checkpoint_method "I/O method for checkpointing" STEERABLE=recover
 } "error"
 
 
+
+BOOLEAN out_initial_data "Output initial data?" STEERABLE=always
+{
+} yes
 
 STRING out_adios2_vars "Variables to output in ADIOS2 format" STEERABLE=always
 {
@@ -708,6 +716,21 @@ INT out_tsv_every "Output in TSV format every that many iterations" STEERABLE=al
   1:* :: "every that many iterations"
 } -1
 
+KEYWORD out_tsv_header "How to output TSV column header" STEERABLE=always
+{
+  "none" :: "no header"
+  "comment" :: "as comment (for backward compatibility)"
+  "plain" :: "plain TSV header"
+} "comment"
+
+BOOLEAN out_tsv_combine_iterations "Combine all iterations into a single TSV file" STEERABLE=recover
+{
+} no
+
+BOOLEAN out_tsv_output_boundary_points "Output outer boundary points in 1d TSV files" STEERABLE=always
+{
+} yes
+
 
 
 SHARES: Cactus
@@ -730,6 +753,7 @@ USES STRING out_dir
 USES CCTK_INT out_every
 USES KEYWORD out_mode
 USES CCTK_INT out_proc_every
+USES KEYWORD out_fileinfo
 
 USES BOOLEAN checkpoint_ID
 USES INT checkpoint_every

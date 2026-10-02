@@ -119,8 +119,8 @@ struct mesh_props_t {
 
 std::string make_subdirname(const std::string &file_name, const int iteration) {
   std::ostringstream buf;
-  buf << file_name                                     //
-      << ".it" << setw(8) << setfill('0') << iteration //
+  buf << file_name                                               //
+      << ".it" << std::setw(8) << std::setfill('0') << iteration //
       << ".silo.dir";
   return buf.str();
 }
@@ -129,16 +129,16 @@ std::string make_filename(const std::string &file_name, const int iteration,
                           const int ioserver = -1) {
   std::ostringstream buf;
   buf << file_name //
-      << ".it" << setw(8) << setfill('0') << iteration;
+      << ".it" << std::setw(8) << std::setfill('0') << iteration;
   if (ioserver >= 0)
-    buf << ".p" << setw(6) << setfill('0') << ioserver;
+    buf << ".p" << std::setw(6) << std::setfill('0') << ioserver;
   buf << ".silo";
   return buf.str();
 }
 
 int match_filename(const std::string &file_name) {
   const std::regex filename_regex("[.]it(\\d+)[.]silo$",
-                                  regex_constants::ECMAScript);
+                                  std::regex_constants::ECMAScript);
   std::smatch sm;
   regex_search(file_name, sm, filename_regex);
   if (sm.empty())
@@ -146,7 +146,7 @@ int match_filename(const std::string &file_name) {
   return std::stoi(sm.str(1));
 }
 
-// The optional `band` tag namespaces subcycling consumer-band meshes/vars
+// The optional `band` tag namespaces subcycling source-band meshes/vars
 // apart from the regular tl=0 data (see subcycling checkpoint/recovery). An
 // empty tag (the default) leaves regular-data names byte-identical.
 std::string make_meshname(const std::array<int, dim> &nghosts,
@@ -164,12 +164,12 @@ std::string make_meshname(const std::array<int, dim> &nghosts,
   for (int d = 0; d < dim; ++d) {
     if (d > 0)
       buf << "_";
-    buf << setw(2) << setfill('0') << nghosts[d];
+    buf << std::setw(2) << std::setfill('0') << nghosts[d];
   }
   if (patch >= 0)
-    buf << ".m" << setw(4) << setfill('0') << patch     //
-        << ".rl" << setw(2) << setfill('0') << reflevel //
-        << ".c" << setw(8) << setfill('0') << component;
+    buf << ".m" << std::setw(4) << std::setfill('0') << patch     //
+        << ".rl" << std::setw(2) << std::setfill('0') << reflevel //
+        << ".c" << std::setw(8) << std::setfill('0') << component;
   if (!band.empty())
     buf << ".band." << band;
   return DB::legalize_name(buf.str());
@@ -187,16 +187,16 @@ std::string make_varname(const int gi, const int vi, const int patch = -1,
   } else {
     const int v0 = CCTK_FirstVarIndexI(gi);
     varname = CCTK_FullVarName(v0 + vi);
-    varname = regex_replace(varname, regex("::"), "-");
+    varname = regex_replace(varname, std::regex("::"), "-");
     for (auto &ch : varname)
       ch = tolower(ch);
   }
   std::ostringstream buf;
   buf << varname;
   if (reflevel >= 0)
-    buf << ".m" << setw(4) << setfill('0') << patch     //
-        << ".rl" << setw(2) << setfill('0') << reflevel //
-        << ".c" << setw(8) << setfill('0') << component;
+    buf << ".m" << std::setw(4) << std::setfill('0') << patch     //
+        << ".rl" << std::setw(2) << std::setfill('0') << reflevel //
+        << ".c" << std::setw(8) << std::setfill('0') << component;
   if (!band.empty())
     buf << ".band." << band;
   return DB::legalize_name(buf.str());
@@ -206,9 +206,9 @@ const std::string driver_name = "CarpetX";
 
 std::string make_fabarraybasename(const int patch, const int reflevel) {
   std::ostringstream buf;
-  buf << "FabArrayBase"                           //
-      << ".m" << setw(4) << setfill('0') << patch //
-      << ".rl" << setw(2) << setfill('0') << reflevel;
+  buf << "FabArrayBase"                                     //
+      << ".m" << std::setw(4) << std::setfill('0') << patch //
+      << ".rl" << std::setw(2) << std::setfill('0') << reflevel;
   return DB::legalize_name(buf.str());
 }
 
@@ -254,6 +254,7 @@ int InputSiloParameters(const std::string &input_dir,
       for (const auto &direntry : filesystem::directory_iterator(input_dir)) {
         const auto &filename = direntry.path().filename().string();
         const int iter = match_filename(filename);
+        using std::max;
         input_iteration = max(input_iteration, iter);
       }
     } catch (const filesystem::filesystem_error &) {
@@ -601,16 +602,22 @@ void InputSilo(const cGH *restrict const cctkGH,
     }
 
     // Bands are written all-or-nothing (only at unsynchronized checkpoints), so
-    // detect their presence once with a global flag. This keeps the band read
+    // detect their presence once with global flags. This keeps the band read
     // symmetric with the regular read; a per-variable file probe inside the
-    // loop would desync the band owner's MPI_Recv.
+    // loop would desync the band owner's MPI_Recv. The source bands (kss_*,
+    // olds) and the flux-register bands (freg_*) are probed separately: a
+    // mid-cycle checkpoint written before flux registers were checkpointed
+    // carries the former but not the latter.
     bool file_has_bands = false;
+    bool file_has_freg = false;
     if (ghext->use_subcycling) {
-      int local_has_bands = 0;
+      int local_has[2] = {0, 0}; // [0]: kss_*/olds, [1]: freg_*
       if (read_file) {
         for (const auto &patchdata : ghext->patchdata) {
           for (const auto &leveldata : patchdata.leveldata) {
-            for (int gi = 0; gi < CCTK_NumGroups() && !local_has_bands; ++gi) {
+            for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+              if (local_has[0] && local_has[1])
+                break;
               if (!input_group.at(gi) || CCTK_GroupTypeI(gi) != CCTK_GF)
                 continue;
               const auto &groupdata = *leveldata.groupdata.at(gi);
@@ -618,7 +625,8 @@ void InputSilo(const cGH *restrict const cctkGH,
                 continue;
               const auto probe = [&](const amrex::MultiFab *const band,
                                      const band_kind kind, const int stage) {
-                if (local_has_bands || !band || band->empty())
+                int &found = local_has[kind == band_kind::flux_register];
+                if (found || !band || band->empty())
                   return;
                 const std::string band_tag = subcycling_band_tag(kind, stage);
                 const amrex::DistributionMapping &bdm = band->DistributionMap();
@@ -628,24 +636,106 @@ void InputSilo(const cGH *restrict const cctkGH,
                   const std::string varname = make_varname(
                       gi, 0, patchdata.patch, leveldata.level, c, band_tag);
                   if (DBInqVarExists(file.get(), varname.c_str())) {
-                    local_has_bands = 1;
+                    found = 1;
                     return;
                   }
                 }
               };
               for (int s = 0; s < max_num_rk_stages; ++s)
-                probe(groupdata.ks_consumer_band[s].get(),
-                      band_kind::ks_consumer, s);
-              probe(groupdata.old_consumer_band.get(), band_kind::old_consumer,
-                    -1);
+                probe(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                     band_kind::ks_source, s),
+                      band_kind::ks_source, s);
+              probe(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                   band_kind::old_source),
+                    band_kind::old_source, -1);
+              for (int f = 0; f < 2 * dim; ++f)
+                probe(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                     band_kind::flux_register, f),
+                      band_kind::flux_register, f);
             }
           }
         }
       }
-      int global_has_bands = 0;
-      MPI_Allreduce(&local_has_bands, &global_has_bands, 1, MPI_INT, MPI_MAX,
-                    mpi_comm);
-      file_has_bands = global_has_bands != 0;
+      int global_has[2] = {0, 0};
+      MPI_Allreduce(local_has, global_has, 2, MPI_INT, MPI_MAX, mpi_comm);
+      file_has_bands = global_has[0] != 0;
+      file_has_freg = global_has[1] != 0;
+
+      // A mid-cycle checkpoint must carry the coarse source bands for every
+      // coarse level that is ahead of its child; a file without any band data
+      // there was written by the derivative-band scheme or is incomplete.
+      // Every rank evaluates the same predicate on replicated data (recovered
+      // iterations, band geometry), so the abort is collective and the
+      // per-component MPI protocol below stays symmetric.
+      if (!file_has_bands) {
+        for (const auto &patchdata : ghext->patchdata) {
+          for (const auto &leveldata : patchdata.leveldata) {
+            if (!recovered_level_needs_rk_bands(patchdata.patch,
+                                                leveldata.level))
+              continue;
+            for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+              if (!input_group.at(gi) || CCTK_GroupTypeI(gi) != CCTK_GF)
+                continue;
+              const auto &groupdata = *leveldata.groupdata.at(gi);
+              if (groupdata.mfab.empty())
+                continue;
+              const amrex::MultiFab *const band = rk_source_band(
+                  patchdata.patch, leveldata.level, gi, band_kind::old_source);
+              if (!band || band->empty())
+                continue; // not evolved, or an empty coarse-fine footprint
+              CCTK_VERROR(
+                  "Mid-cycle checkpoint lacks coarse RK step data (bands %s, "
+                  "%s..) for group %s on patch %d level %d. The checkpoint "
+                  "was written by the derivative-band scheme or is "
+                  "incomplete. Restart from a time-aligned checkpoint.",
+                  subcycling_band_tag(band_kind::old_source).c_str(),
+                  subcycling_band_tag(band_kind::ks_source, 0).c_str(),
+                  CCTK_FullGroupName(gi), patchdata.patch, leveldata.level);
+            }
+          }
+        }
+      }
+
+      // Likewise the child's flux register wherever it is live: without it
+      // the first reflux after recovery would apply only the remaining fine
+      // substeps' fluxes. Same collective predicate as above.
+      if (!file_has_freg) {
+        for (const auto &patchdata : ghext->patchdata) {
+          for (const auto &leveldata : patchdata.leveldata) {
+            if (!recovered_flux_register_is_live(patchdata.patch,
+                                                 leveldata.level))
+              continue;
+            for (int gi = 0; gi < CCTK_NumGroups(); ++gi) {
+              if (!input_group.at(gi) || CCTK_GroupTypeI(gi) != CCTK_GF)
+                continue;
+              const auto &groupdata = *leveldata.groupdata.at(gi);
+              if (groupdata.mfab.empty())
+                continue;
+              const amrex::MultiFab *const band =
+                  rk_source_band(patchdata.patch, leveldata.level, gi,
+                                 band_kind::flux_register, 0);
+              if (!band || band->empty())
+                continue; // no register for this group
+              // A do_reflux mismatch cannot reach this error: the parameter
+              // is STEERABLE = NEVER and the flesh restores it from the
+              // checkpoint before any variable is read, so a differing
+              // par-file value aborts in IOUtil_SetAllParameters and an
+              // omitted one adopts the checkpoint's, allocating no register
+              // when that is "no". What arrives here is a checkpoint written
+              // before flux-register checkpointing existed, or a truncated
+              // one.
+              CCTK_VERROR(
+                  "Mid-cycle checkpoint lacks flux-register data (bands "
+                  "%s..) for group %s on patch %d level %d. The checkpoint "
+                  "was written by a version without flux-register "
+                  "checkpointing or is incomplete. Restart from a "
+                  "time-aligned checkpoint.",
+                  subcycling_band_tag(band_kind::flux_register, 0).c_str(),
+                  CCTK_FullGroupName(gi), patchdata.patch, leveldata.level);
+            }
+          }
+        }
+      }
     }
 
     // Loop over patches and levels
@@ -809,11 +899,12 @@ void InputSilo(const cGH *restrict const cctkGH,
 
           } // for component
 
-          // Subcycling consumer bands: zero-ghost MultiFabs with their own
-          // DistributionMap, each read in its own component loop mirroring the
-          // Phase 1 write (reversed MPI). When file_has_bands, every rebuilt
-          // non-empty band is present in full.
-          if (file_has_bands) {
+          // Subcycling coarse source bands: zero-ghost MultiFabs with their
+          // own DistributionMap, each read in its own component loop mirroring
+          // the Phase 1 write (reversed MPI). When file_has_bands, every
+          // rebuilt non-empty source band is present in full, and likewise
+          // every flux-register band when file_has_freg.
+          if (file_has_bands || file_has_freg) {
             const int centering = [&]() {
               const int rank = indextype.cellCentered(0) +
                                indextype.cellCentered(1) +
@@ -916,12 +1007,27 @@ void InputSilo(const cGH *restrict const cctkGH,
               } // for band component
             };
 
-            for (int s = 0; s < max_num_rk_stages; ++s)
-              read_band(groupdata.ks_consumer_band[s].get(),
-                        band_kind::ks_consumer, s);
-            read_band(groupdata.old_consumer_band.get(),
-                      band_kind::old_consumer, -1);
-          } // if file_has_bands
+            if (file_has_bands) {
+              for (int s = 0; s < max_num_rk_stages; ++s)
+                read_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                         band_kind::ks_source, s),
+                          band_kind::ks_source, s);
+              read_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                       band_kind::old_source),
+                        band_kind::old_source, -1);
+            }
+            // The child's flux register (six faces), restored so that the
+            // first reflux after recovery repays the same mismatch the
+            // uninterrupted run would have. Null (skipped) for groups
+            // without a register. When absent the register stays zero; the
+            // check above guarantees it is not live, so the parent resets it
+            // before its next reflux.
+            if (file_has_freg)
+              for (int f = 0; f < 2 * dim; ++f)
+                read_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                         band_kind::flux_register, f),
+                          band_kind::flux_register, f);
+          } // if file_has_bands || file_has_freg
 
         } // for gi
       } // for leveldata
@@ -990,9 +1096,10 @@ void OutputSilo(const cGH *restrict const cctkGH,
 
   constexpr int ndims = dim;
 
-  // At an unsynchronized subcycling checkpoint the fine consumer bands hold
-  // mid-cycle state that exists nowhere else and must be serialized. Otherwise
-  // the on-disk format is unchanged.
+  // At an unsynchronized subcycling checkpoint the coarse source bands hold
+  // the in-progress coarse step (u(t_n) and the stage derivatives), which
+  // exists nowhere else and must be serialized. Otherwise the on-disk format
+  // is unchanged.
   const bool write_bands = !all_levels_synchronized();
 
   // 2D slice output maps a physical coord to an index via (coord - x0)/dx,
@@ -1022,7 +1129,7 @@ void OutputSilo(const cGH *restrict const cctkGH,
     const std::string subdirname = make_subdirname(output_file, cctk_iteration);
     const std::string pathname = std::string(output_dir) + "/" + subdirname;
     const int mode = 0755;
-    static once_flag create_directory;
+    static std::once_flag create_directory;
     call_once(create_directory, [&]() {
       const int ierr = CCTK_CreateDirectory(mode, output_dir.c_str());
       assert(ierr >= 0);
@@ -1408,11 +1515,12 @@ void OutputSilo(const cGH *restrict const cctkGH,
 
           } // for component
 
-          // Subcycling consumer bands: zero-ghost MultiFabs in this level's
-          // index space with their own DistributionMap, so each gets its own
-          // component loop. Geometry is rebuilt on recovery; we serialize only
-          // the data, namespaced by a band tag. 2D slice output covers only the
-          // main grid data, so bands are skipped entirely when slicing.
+          // Subcycling coarse source bands: zero-ghost MultiFabs in this
+          // level's index space with their own DistributionMap, so each gets
+          // its own component loop. Geometry is rebuilt on recovery; we
+          // serialize only the data, namespaced by a band tag. Present on
+          // every level with children. 2D slice output covers only the main
+          // grid data, so bands are skipped entirely when slicing.
           if (write_bands && !slice) {
             const int centering = [&]() {
               const int rank = indextype.cellCentered(0) +
@@ -1587,10 +1695,21 @@ void OutputSilo(const cGH *restrict const cctkGH,
             };
 
             for (int s = 0; s < max_num_rk_stages; ++s)
-              write_band(groupdata.ks_consumer_band[s].get(),
-                         band_kind::ks_consumer, s);
-            write_band(groupdata.old_consumer_band.get(),
-                       band_kind::old_consumer, -1);
+              write_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                        band_kind::ks_source, s),
+                         band_kind::ks_source, s);
+            write_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                      band_kind::old_source),
+                       band_kind::old_source, -1);
+            // The child's flux register (partially accumulated mid-cycle):
+            // six zero-ghost face MultiFabs in this level's index space,
+            // nodal in their own direction. They are serialized like the
+            // bands above, as thickness-1 slabs with the group's (zone)
+            // centering; the mesh is hidden and only the data round-trips.
+            for (int f = 0; f < 2 * dim; ++f)
+              write_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                        band_kind::flux_register, f),
+                         band_kind::flux_register, f);
           } // if write_bands
 
         } // for gi
@@ -1786,7 +1905,7 @@ void OutputSilo(const cGH *restrict const cctkGH,
                     const amrex::Box &box = mfab.box(component); // interior
                     amrex::Box refined_box(box);
                     refined_box.refine(2);
-                    const std::vector<pair<int, amrex::Box> > child_boxes =
+                    const std::vector<std::pair<int, amrex::Box> > child_boxes =
                         fine_boxarray.intersections(refined_box);
                     std::vector<int> children;
                     children.reserve(child_boxes.size());
@@ -2421,7 +2540,7 @@ void OutputSilo(const cGH *restrict const cctkGH,
         buf << output_dir << "/" << output_file << ".silo.visit";
         return buf.str();
       }();
-      ofstream visit(visitname, ios::app);
+      std::ofstream visit(visitname, std::ios::app);
       assert(visit.good());
       visit << make_filename(output_file, cctk_iteration) << "\n";
     }

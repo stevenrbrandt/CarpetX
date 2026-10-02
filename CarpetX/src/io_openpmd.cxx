@@ -42,6 +42,7 @@ static inline int omp_in_parallel() { return 0; }
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -366,7 +367,7 @@ struct carpetx_openpmd_t {
   ////////////////////////////////////////////////////////////////////////////////
 
   // Allowed characters are only [A-Za-z_]
-  // The optional `band` tag namespaces subcycling consumer-band meshes apart
+  // The optional `band` tag namespaces subcycling source-band meshes apart
   // from the regular tl=0 data (see subcycling checkpoint/recovery). An empty
   // tag (the default) leaves regular-data mesh names unchanged.
   static std::string make_meshname(const int gi, const int patch,
@@ -379,12 +380,12 @@ struct carpetx_openpmd_t {
     std::ostringstream buf;
     buf << groupname;
     if (patch != -1)
-      buf << "_patch" << setw(2) << setfill('0') << patch;
+      buf << "_patch" << std::setw(2) << std::setfill('0') << patch;
     if (level != -1)
-      // The suffix should be `_lvl<N>`. No `setfill`?
-      buf << "_lev" << setw(2) << setfill('0') << level;
+      // The suffix should be `_lvl<N>`. No `std::setfill`?
+      buf << "_lev" << std::setw(2) << std::setfill('0') << level;
     if (tl > 0)
-      buf << "_tl" << setw(2) << setfill('0') << tl;
+      buf << "_tl" << std::setw(2) << std::setfill('0') << tl;
     if (!band.empty())
       buf << "_band_" << band;
     return buf.str();
@@ -566,7 +567,7 @@ int carpetx_openpmd_t::InputOpenPMDParameters(const std::string &input_dir,
     const openPMD::Attribute parameters_attr =
         read_iter->getAttribute("AllParameters");
     assert(parameters_attr.dtype == openPMD::Datatype::STRING);
-    const string parameters = parameters_attr.get<std::string>();
+    const std::string parameters = parameters_attr.get<std::string>();
     IOUtil_SetAllParameters(parameters.data());
   }
 
@@ -681,6 +682,8 @@ void carpetx_openpmd_t::InputOpenPMDGridStructure(cGH *cctkGH,
 
       amrex::BoxList boxlist(std::move(levboxes));
       amrex::BoxArray boxarray(std::move(boxlist));
+      if (rechop_on_recovery)
+        boxarray = patchdata.amrcore->RechopLevel(level, boxarray);
       patchdata.amrcore->SetBoxArray(level, boxarray);
 
       amrex::DistributionMapping dm(boxarray);
@@ -1102,10 +1105,19 @@ void carpetx_openpmd_t::InputOpenPMD(const cGH *const cctkGH,
                   []() { return "read from openPMD file"; });
           } // for tl
 
-          // Subcycling consumer bands (see OutputOpenPMD): zero-ghost MultiFabs
-          // sharing the level's idomain frame. Guard on mesh existence so
-          // synchronized/old checkpoints leave the rebuilt band untouched.
+          // Subcycling coarse source bands (see OutputOpenPMD): zero-ghost
+          // MultiFabs sharing the level's idomain frame. A time-aligned
+          // checkpoint carries no bands, so a missing mesh leaves the rebuilt
+          // band untouched; a mid-cycle checkpoint must carry them for every
+          // coarse level that is ahead of its child, so there a missing mesh
+          // (old derivative-band format, or a truncated file) is refused.
+          // Likewise the child's flux register must be present wherever it is
+          // live (see recovered_flux_register_is_live).
           {
+            const bool need_rk_bands = recovered_level_needs_rk_bands(
+                leveldata.patch, leveldata.level);
+            const bool need_freg_bands = recovered_flux_register_is_live(
+                leveldata.patch, leveldata.level);
             const auto read_band = [&](amrex::MultiFab *const band,
                                        const band_kind kind, const int stage) {
               if (!band || band->empty())
@@ -1114,8 +1126,31 @@ void carpetx_openpmd_t::InputOpenPMD(const cGH *const cctkGH,
               const std::string band_tag = subcycling_band_tag(kind, stage);
               const std::string meshname = make_meshname(
                   gi, leveldata.patch, leveldata.level, 0, band_tag);
-              if (!read_iter->meshes.count(meshname))
-                return; // old/synchronized checkpoint: no band data
+              if (!read_iter->meshes.count(meshname)) {
+                // A do_reflux mismatch cannot reach this error: the parameter
+                // is STEERABLE = NEVER and the flesh restores it from the
+                // checkpoint before any mesh is read, so a differing par-file
+                // value aborts in IOUtil_SetAllParameters and an omitted one
+                // adopts the checkpoint's, allocating no register when that is
+                // "no". What arrives here is a checkpoint written before
+                // flux-register checkpointing existed, or a truncated one.
+                if (kind == band_kind::flux_register ? need_freg_bands
+                                                     : need_rk_bands)
+                  CCTK_VERROR(
+                      "Mid-cycle checkpoint lacks %s: mesh \"%s\" (band %s) "
+                      "for group %s on patch %d level %d is missing. The "
+                      "checkpoint was written by %s or is incomplete. "
+                      "Restart from a time-aligned checkpoint.",
+                      kind == band_kind::flux_register ? "flux-register data"
+                                                       : "coarse RK step data",
+                      meshname.c_str(), band_tag.c_str(),
+                      CCTK_FullGroupName(gi), leveldata.patch, leveldata.level,
+                      kind == band_kind::flux_register
+                          ? "a version without flux-register checkpointing"
+                          : "the derivative-band scheme");
+                return; // not needed: time-aligned, or a register the
+                        // parent resets before its next reflux
+              }
               if (io_verbose)
                 CCTK_VINFO("Reading band mesh %s...", meshname.c_str());
               const openPMD::Mesh &mesh = read_iter->meshes.at(meshname);
@@ -1167,10 +1202,19 @@ void carpetx_openpmd_t::InputOpenPMD(const cGH *const cctkGH,
             };
 
             for (int s = 0; s < max_num_rk_stages; ++s)
-              read_band(groupdata.ks_consumer_band[s].get(),
-                        band_kind::ks_consumer, s);
-            read_band(groupdata.old_consumer_band.get(),
-                      band_kind::old_consumer, -1);
+              read_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                       band_kind::ks_source, s),
+                        band_kind::ks_source, s);
+            read_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                     band_kind::old_source),
+                      band_kind::old_source, -1);
+            // The child's flux register, restored so that the first reflux
+            // after recovery repays the same mismatch the uninterrupted run
+            // would have. Null (skipped) for groups without a register.
+            for (int f = 0; f < 2 * dim; ++f)
+              read_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                       band_kind::flux_register, f),
+                        band_kind::flux_register, f);
           }
         }
       } // for gi
@@ -1475,7 +1519,7 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
     if (io_verbose)
       CCTK_VINFO("Creating openPMD object...");
     const int mode = 0755;
-    static once_flag create_directory;
+    static std::once_flag create_directory;
     call_once(create_directory, [&]() {
       const int ierr = CCTK_CreateDirectory(mode, output_dir.c_str());
       assert(ierr >= 0);
@@ -1507,10 +1551,16 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
                                                  MPI_COMM_WORLD, options);
     series->setIterationEncoding(iterationEncoding);
 
+    // Series metadata must be rank-identical (HDF5 metadata writes are
+    // collective): broadcast rank 0's author and hostname.
     {
+      char author[1000] = {0};
       char const *const user = getenv("USER");
       if (user)
-        series->setAuthor(user);
+        std::snprintf(author, sizeof author, "%s", user);
+      MPI_Bcast(author, sizeof author, MPI_CHAR, 0, MPI_COMM_WORLD);
+      if (author[0])
+        series->setAuthor(author);
     }
     // Software is always "openPMD-api"
     // series->setSoftware("Einstein Toolkit <https://einsteintoolkit.org>");
@@ -1524,6 +1574,7 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
     {
       char hostname[1000];
       Util_GetHostName(hostname, sizeof hostname);
+      MPI_Bcast(hostname, sizeof hostname, MPI_CHAR, 0, MPI_COMM_WORLD);
       series->setMachine(hostname);
     }
 
@@ -1544,20 +1595,24 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
   const int myproc = CCTK_MyProc(cctkGH);
   const int ioproc = 0;
 
-  // At an unsynchronized subcycling checkpoint the fine consumer bands hold
-  // mid-cycle state that exists nowhere else and must be serialized. Otherwise
-  // the on-disk format is unchanged.
+  // At an unsynchronized subcycling checkpoint the coarse source bands hold
+  // the in-progress coarse step (u(t_n) and the stage derivatives), which
+  // exists nowhere else and must be serialized. Otherwise the on-disk format
+  // is unchanged.
   const bool write_bands = !all_levels_synchronized();
 
-  // Write parameters (recovery-only; omitted for plot-only slice files)
-  if (myproc == ioproc && !slice) {
+  // Iteration attributes are set on EVERY rank (all inputs are replicated):
+  // rank-asymmetric writes deadlock the HDF5 backend's collective metadata.
+
+  // Write parameters
+  {
     char *const data = IOUtil_GetAllParameters(cctkGH, 1 /*all*/);
     const std::string parameters(data);
     std::free(data);
     write_iter.setAttribute("AllParameters", parameters);
   }
 
-  if (myproc == ioproc && !slice) {
+  if (!slice) {
     const int ndims = Loop::dim;
     write_iter.setAttribute<std::int64_t>("numDims", ndims);
     const int npatches = ghext->patchdata.size();
@@ -1568,7 +1623,7 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
       std::ostringstream buf;
       // String attributes cannot be empty; we thus always need to use a patch
       // suffix if (ghext->num_patches() > 1)
-      buf << "_patch" << setw(2) << setfill('0') << patch;
+      buf << "_patch" << std::setw(2) << std::setfill('0') << patch;
       patch_suffixes.at(patch) = buf.str();
     }
     write_iter.setAttribute("patchSuffixes", patch_suffixes);
@@ -1581,8 +1636,8 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
       for (const auto &leveldata : patchdata.leveldata) {
         const int level = leveldata.level;
         std::ostringstream buf;
-        buf << patch_suffixes.at(patch) << "_lev" << setw(2) << setfill('0')
-            << level;
+        buf << patch_suffixes.at(patch) << "_lev" << std::setw(2)
+            << std::setfill('0') << level;
         level_suffixes.at(level) = buf.str();
       }
       write_iter.setAttribute("levelSuffixes" + patch_suffixes.at(patch),
@@ -1613,7 +1668,7 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
             static_cast<std::int64_t>(leveldata.iteration.den));
       }
     }
-  } // if ioproc
+  } // if !slice
 
   // First write grid functions in a loop over patches and levels
 
@@ -1891,11 +1946,12 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
             } // for local_component
           } // for tl
 
-          // Subcycling consumer bands: zero-ghost MultiFabs in this level's
-          // index space, so they share the level's idomain frame and dataset
-          // extent and write a sparse subset of chunks. Geometry is rebuilt on
-          // recovery; we serialize only the data, namespaced by a band tag.
-          // 2D slices emit only the main grid data; bands remain 3D-only.
+          // Subcycling coarse source bands: zero-ghost MultiFabs in this
+          // level's index space, so they share the level's idomain frame and
+          // dataset extent and write a sparse subset of chunks. Geometry is
+          // rebuilt on recovery; we serialize only the data, namespaced by a
+          // band tag. Present on every level with children. 2D slices emit
+          // only the main grid data; bands remain 3D-only.
           if (write_bands && !slice) {
             const auto write_band = [&](const amrex::MultiFab *const band,
                                         const band_kind kind, const int stage) {
@@ -1977,10 +2033,20 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
             };
 
             for (int s = 0; s < max_num_rk_stages; ++s)
-              write_band(groupdata.ks_consumer_band[s].get(),
-                         band_kind::ks_consumer, s);
-            write_band(groupdata.old_consumer_band.get(),
-                       band_kind::old_consumer, -1);
+              write_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                        band_kind::ks_source, s),
+                         band_kind::ks_source, s);
+            write_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                      band_kind::old_source),
+                       band_kind::old_source, -1);
+            // The child's flux register (partially accumulated mid-cycle):
+            // six zero-ghost face MultiFabs in this level's index space,
+            // nodal in their own direction. idomain is vertex-framed, so a
+            // face plane on the domain boundary still fits the dataset.
+            for (int f = 0; f < 2 * dim; ++f)
+              write_band(rk_source_band(patchdata.patch, leveldata.level, gi,
+                                        band_kind::flux_register, f),
+                         band_kind::flux_register, f);
           } // if write_bands
         }
       } // for gi
@@ -1992,7 +2058,9 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
   // Slices emit only GF data; a non-GF group in out_openpmd_2d_vars produces
   // nothing here.
 
-  if (myproc == ioproc && !slice) {
+  // Mesh and dataset definitions are collective (HDF5); only the data write
+  // below is restricted to a single rank (the data is replicated).
+  if (!slice) {
     const int numgroups = CCTK_NumGroups();
     for (int gi = 0; gi < numgroups; ++gi) {
       if (output_group.at(gi)) {
@@ -2122,76 +2190,79 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
         assert(cactus_dk > 0);
         assert(cactus_np > 0);
         assert(int(groupdata.data.at(tl).size()) == numvars * cactus_np);
-        for (int vi = 0; vi < numvars; ++vi) {
-          const void *const var_ptr =
-              groupdata.data.at(tl).data_at(vi * cactus_np);
-          if (output_ghosts || intbox == extbox) {
+        // Replicated data; only one rank writes.
+        if (myproc == ioproc) {
+          for (int vi = 0; vi < numvars; ++vi) {
+            const void *const var_ptr =
+                groupdata.data.at(tl).data_at(vi * cactus_np);
+            if (output_ghosts || intbox == extbox) {
 #if !OPENPMDAPI_VERSION_GE(0, 15, 0)
 #define storeChunkRaw(ptr, start, count)                                       \
   storeChunk(openPMD::shareRaw(ptr), start, count)
 #endif
-            switch (cgroup.vartype) {
-            case CCTK_VARIABLE_REAL:
-              record_components.at(vi).storeChunkRaw(
-                  static_cast<CCTK_REAL const *>(var_ptr), start, count);
-              break;
-            case CCTK_VARIABLE_INT:
-              record_components.at(vi).storeChunkRaw(
-                  static_cast<CCTK_INT const *>(var_ptr), start, count);
-              break;
-            case CCTK_VARIABLE_COMPLEX:
-              record_components.at(vi).storeChunkRaw(
-                  static_cast<CCTK_COMPLEX const *>(var_ptr), start, count);
-              break;
-            default:
-              assert(0 && "Unexpected variable type");
+              switch (cgroup.vartype) {
+              case CCTK_VARIABLE_REAL:
+                record_components.at(vi).storeChunkRaw(
+                    static_cast<CCTK_REAL const *>(var_ptr), start, count);
+                break;
+              case CCTK_VARIABLE_INT:
+                record_components.at(vi).storeChunkRaw(
+                    static_cast<CCTK_INT const *>(var_ptr), start, count);
+                break;
+              case CCTK_VARIABLE_COMPLEX:
+                record_components.at(vi).storeChunkRaw(
+                    static_cast<CCTK_COMPLEX const *>(var_ptr), start, count);
+                break;
+              default:
+                assert(0 && "Unexpected variable type");
+              }
+            } else {
+              auto cactus_ptr = &groupdata.data.at(tl);
+              const Arith::vect<int, 3> contig_shape = box.shape();
+              constexpr int contig_di = 1;
+              const int contig_dj = contig_di * contig_shape[0];
+              const int contig_dk = contig_dj * contig_shape[1];
+              const int contig_np = contig_dk * contig_shape[2];
+              assert(contig_np == np);
+              auto contig_ptr =
+                  new GHExt::GlobalData::AnyTypeVector(cgroup.vartype, np);
+              for (int k = 0; k < contig_shape[2]; ++k)
+                for (int j = 0; j < contig_shape[1]; ++j)
+                  for (int i = 0; i < contig_shape[0]; ++i)
+                    // TODO: copy whole contiguous strip at once
+                    memcpy(contig_ptr->data_at(contig_di * i + contig_dj * j +
+                                               contig_dk * k),
+                           cactus_ptr->data_at(cactus_di * i + cactus_dj * j +
+                                               cactus_dk * k + vi * cactus_np),
+                           CCTK_VarTypeSize(cgroup.vartype));
+              switch (cgroup.vartype) {
+              case CCTK_VARIABLE_REAL:
+                record_components.at(vi).storeChunk(
+                    std::shared_ptr<CCTK_REAL>(
+                        static_cast<CCTK_REAL *>(contig_ptr->data_at(0)),
+                        [=](CCTK_REAL *) { delete contig_ptr; }),
+                    start, count);
+                break;
+              case CCTK_VARIABLE_INT:
+                record_components.at(vi).storeChunk(
+                    std::shared_ptr<CCTK_INT>(
+                        static_cast<CCTK_INT *>(contig_ptr->data_at(0)),
+                        [=](CCTK_INT *const) { delete contig_ptr; }),
+                    start, count);
+                break;
+              case CCTK_VARIABLE_COMPLEX:
+                record_components.at(vi).storeChunk(
+                    std::shared_ptr<CCTK_COMPLEX>(
+                        static_cast<CCTK_COMPLEX *>(contig_ptr->data_at(0)),
+                        [=](CCTK_COMPLEX *const) { delete contig_ptr; }),
+                    start, count);
+                break;
+              default:
+                assert(0 && "Unexpected variable type");
+              }
             }
-          } else {
-            auto cactus_ptr = &groupdata.data.at(tl);
-            const Arith::vect<int, 3> contig_shape = box.shape();
-            constexpr int contig_di = 1;
-            const int contig_dj = contig_di * contig_shape[0];
-            const int contig_dk = contig_dj * contig_shape[1];
-            const int contig_np = contig_dk * contig_shape[2];
-            assert(contig_np == np);
-            auto contig_ptr =
-                new GHExt::GlobalData::AnyTypeVector(cgroup.vartype, np);
-            for (int k = 0; k < contig_shape[2]; ++k)
-              for (int j = 0; j < contig_shape[1]; ++j)
-                for (int i = 0; i < contig_shape[0]; ++i)
-                  // TODO: copy whole contiguous strip at once
-                  memcpy(contig_ptr->data_at(contig_di * i + contig_dj * j +
-                                             contig_dk * k),
-                         cactus_ptr->data_at(cactus_di * i + cactus_dj * j +
-                                             cactus_dk * k + vi * cactus_np),
-                         CCTK_VarTypeSize(cgroup.vartype));
-            switch (cgroup.vartype) {
-            case CCTK_VARIABLE_REAL:
-              record_components.at(vi).storeChunk(
-                  std::shared_ptr<CCTK_REAL>(
-                      static_cast<CCTK_REAL *>(contig_ptr->data_at(0)),
-                      [=](CCTK_REAL *) { delete contig_ptr; }),
-                  start, count);
-              break;
-            case CCTK_VARIABLE_INT:
-              record_components.at(vi).storeChunk(
-                  std::shared_ptr<CCTK_INT>(
-                      static_cast<CCTK_INT *>(contig_ptr->data_at(0)),
-                      [=](CCTK_INT *const) { delete contig_ptr; }),
-                  start, count);
-              break;
-            case CCTK_VARIABLE_COMPLEX:
-              record_components.at(vi).storeChunk(
-                  std::shared_ptr<CCTK_COMPLEX>(
-                      static_cast<CCTK_COMPLEX *>(contig_ptr->data_at(0)),
-                      [=](CCTK_COMPLEX *const) { delete contig_ptr; }),
-                  start, count);
-              break;
-            default:
-              assert(0 && "Unexpected variable type");
-            }
-          }
-        } // for vi
+          } // for vi
+        }
       }
     }
   }
@@ -2231,12 +2302,12 @@ void carpetx_openpmd_t::OutputOpenPMD(const cGH *const cctkGH,
     std::ostringstream buf;
     buf << output_dir << "/" << output_file << ".openpmd.visit";
     const std::string visitname = buf.str();
-    std::ofstream visit(visitname, ios::app);
+    std::ofstream visit(visitname, std::ios::app);
     assert(visit.good());
     switch (iterationEncoding) {
     case openPMD::IterationEncoding::fileBased:
-      visit << output_file << ".it" << setw(8) << setfill('0') << cctk_iteration
-            << openPMD::suffix(format) << "\n";
+      visit << output_file << ".it" << std::setw(8) << std::setfill('0')
+            << cctk_iteration << openPMD::suffix(format) << "\n";
       break;
     case openPMD::IterationEncoding::variableBased:
       visit << output_file << openPMD::suffix(format) << "\n";
