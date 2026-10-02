@@ -565,6 +565,7 @@ struct GHExt {
   // max_num_rk_stages (ODESolvers_CheckMethod rejects the others at
   // PARAMCHECK) and sizes the bands; without subcycling it may exceed that
   // (RKF78: 11, DP87: 13) and only bounds the stage AccumulateFluxes accepts.
+
   int num_rk_stages = 4;
 
   // Groups advanced by the time integrator, published by it at WRAGH
@@ -576,6 +577,11 @@ struct GHExt {
   // Per-level iteration values read from checkpoint; consumed by recovery fixup
   // in schedule.cxx. Indexed [patch][level]. Empty outside of recovery window.
   std::vector<std::vector<std::optional<rat64> > > recovered_level_iterations;
+
+  // Chombo-style level-local regridding counters, used only when
+  // BHClusterTagging enables CarpetX::regrid_intervals. They are reset for a
+  // regridded level and all of its children.
+  std::vector<unsigned long long> bhcluster_regrid_steps;
 
   int num_patches() const { return patchdata.size(); }
   int num_levels(const int patch) const {
