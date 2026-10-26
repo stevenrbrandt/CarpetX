@@ -135,6 +135,10 @@ extern "C" void ODESolvers_Solve_Subcycling(CCTK_ARGUMENTS) {
                 "Set Driver::use_subcycling = no.",
                 method);
 
+  // method and rhs_timelevels are steerable. Allocate before this step
+  // caches MultiFab pointers. Multistep methods have already been refused.
+  setup_rhs_storage(method, rhs_timelevels, verbose, use_subcycling);
+
   static bool did_output = false;
   if (verbose || !did_output)
     CCTK_VINFO("Integrator is %s", method);

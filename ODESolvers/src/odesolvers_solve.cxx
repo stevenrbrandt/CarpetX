@@ -23,12 +23,28 @@ int history_depth(const char *const method) {
   return 0;
 }
 
-// Time levels of each RHS group. A hybrid method needs its history slots plus
-// room to park stage values that have to outlive a later RHS evaluation.
-// Four covers both hybrid methods. The user has to declare that many anyway,
-// because ODESolvers::method is steerable.
-int rhs_timelevels(const char *const method) {
-  return history_depth(method) == 0 ? 1 : 4;
+// Persistent RHS slots. CycleTimelevels rotates the last MultiFab to the
+// front, so the step leaves f(y_n) in slot 0 and the next cycle places it
+// in slot 1, shifting older history up by one. That is one slot for the
+// current RHS plus one per saved history value. Stage values that must
+// outlive the next RHS evaluation are temporary copies, not extra time
+// levels. TIMELEVELS in interface.ccl is only the ceiling: the method is
+// steerable, and ODESolvers::rhs_timelevels chooses how many to allocate.
+int minimum_rhs_timelevels(const char *const method) {
+  return 1 + history_depth(method);
+}
+
+int allocated_rhs_timelevels(const char *const method, const int requested) {
+  const int minimum = minimum_rhs_timelevels(method);
+  if (requested < 0)
+    CCTK_VERROR("ODESolvers::rhs_timelevels = %d is negative", requested);
+  if (requested > 0 && requested < minimum)
+    CCTK_VERROR(
+        "ODESolvers::rhs_timelevels = %d is below the %d RHS time level(s) "
+        "method \"%s\" needs (%d history value(s), plus the current RHS). "
+        "Set ODESolvers::rhs_timelevels = 0 to allocate that minimum.",
+        requested, minimum, method, history_depth(method));
+  return requested == 0 ? minimum : requested;
 }
 
 // Ask the driver for the RHS time levels the current method needs.
@@ -36,8 +52,8 @@ int rhs_timelevels(const char *const method) {
 // Called at WRAGH, before any level exists, so the first allocation is
 // already the right size. Called again at the top of every step, because the
 // method is steerable.
-void setup_rhs_storage(const char *const method, const bool verbose,
-                       const bool use_subcycling) {
+void setup_rhs_storage(const char *const method, const int requested,
+                       const bool verbose, const bool use_subcycling) {
   const int depth = history_depth(method);
   if (depth > 0 && use_subcycling)
     CCTK_VERROR("ODESolvers method \"%s\" keeps RHS history in extra time "
@@ -45,7 +61,8 @@ void setup_rhs_storage(const char *const method, const bool verbose,
                 "Set Driver::use_subcycling = no.",
                 method);
 
-  const int ntls = rhs_timelevels(method);
+  const int minimum = minimum_rhs_timelevels(method);
+  const int ntls = allocated_rhs_timelevels(method, requested);
   const int num_groups = CCTK_NumGroups();
   for (int gi = 0; gi < num_groups; ++gi) {
     if (CCTK_GroupTypeI(gi) != CCTK_GF)
@@ -56,16 +73,15 @@ void setup_rhs_storage(const char *const method, const bool verbose,
 
     const int declared_ntls = CCTK_DeclaredTimeLevelsGI(rhs_gi);
     if (ntls > declared_ntls)
-      CCTK_VERROR("The ODE solver method \"%s\" keeps %d previous RHS "
-                  "evaluation(s), and needs %d time levels of the RHS "
-                  "group \"%s\", named by \"%s\", to hold them and its own "
-                  "stage values. That group declares %d. Write TIMELEVELS=%d "
-                  "in its interface.ccl.",
-                  method, depth, ntls, CCTK_FullGroupName(rhs_gi),
+      CCTK_VERROR("ODESolvers method \"%s\" needs %d RHS time level(s), and "
+                  "ODESolvers::rhs_timelevels asks for %d. Group \"%s\", "
+                  "named by \"%s\", declares %d. Write TIMELEVELS=%d in its "
+                  "interface.ccl, or set ODESolvers::rhs_timelevels = 0.",
+                  method, minimum, ntls, CCTK_FullGroupName(rhs_gi),
                   CCTK_FullGroupName(gi), declared_ntls, ntls);
 
     const int old_ntls = CarpetX::SetGroupTimelevels(rhs_gi, ntls);
-    if (verbose && old_ntls != ntls)
+    if (old_ntls != ntls)
       CCTK_VINFO("Method \"%s\": RHS group \"%s\" now has %d time level(s), "
                  "was %d",
                  method, CCTK_FullGroupName(rhs_gi), ntls, old_ntls);
@@ -134,7 +150,7 @@ extern "C" void ODESolvers_SetupStorage(CCTK_ARGUMENTS) {
   DECLARE_CCTK_ARGUMENTS_ODESolvers_SetupStorage;
   DECLARE_CCTK_PARAMETERS;
 
-  setup_rhs_storage(method, verbose, use_subcycling);
+  setup_rhs_storage(method, rhs_timelevels, verbose, use_subcycling);
 }
 
 extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
@@ -163,7 +179,7 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
 
   // method is steerable, so the count requested at WRAGH may no longer match.
   // Re-request before anything below caches a MultiFab pointer.
-  setup_rhs_storage(method, verbose, use_subcycling);
+  setup_rhs_storage(method, rhs_timelevels, verbose, use_subcycling);
   // SetGroupTimelevels refuses to run while this is set.
   const CarpetX::integrating_guard_t integrating_guard;
 
@@ -457,8 +473,7 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       };
 
   // A state vector addressing RHS time level `slot` on every active level.
-  // Rebuild it after SwapGroupTimelevels: a statecomp_t keeps the MultiFab
-  // that used to sit in that slot.
+  // The view keeps that slot's current MultiFab.
   const auto slot_state = [&](const int slot) {
     statecomp_t result;
     CarpetX::active_levels->loop_serially([&](const auto &leveldata) {
@@ -476,9 +491,23 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     return result;
   };
 
-  const auto swap_rhs_slots = [&](const int a, const int b) {
-    for (const int rhs_gi : rhs_groups)
-      CarpetX::SwapGroupTimelevels(rhs_gi, a, b);
+  // copy() shares the RHS group's validity flags and keeps its own
+  // MultiFab. mark_invalid clears time level 0, so a saved stage has to be
+  // marked valid again before the next combination. The MultiFab still holds
+  // the saved RHS.
+  const auto save_slot0 = [&]() {
+    return copy_state(slot_state(0), make_valid_int());
+  };
+  const auto refresh_saved = [](const statecomp_t &saved) {
+    saved.set_valid(make_valid_int());
+  };
+  // CycleTimelevels moves slot 0 to slot 1. Leave f(y_n) there, not the
+  // last stage RHS.
+  const auto restore_slot0 = [&](const statecomp_t &saved) {
+    refresh_saved(saved);
+    const auto slot0 = slot_state(0);
+    statecomp_t::lincomb(slot0, 0.0, reals<1>{CCTK_REAL(1)}, states<1>{&saved},
+                         make_valid_int());
   };
 
   const auto history_incomplete = [&](const int depth) {
@@ -501,18 +530,21 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     return incomplete;
   };
 
-  // Slots past the method's history depth hold stage scratch. Poison them so
-  // a different hybrid method steered in on the next step does not treat
-  // them as history.
+  // Extra allocated slots are not history. Poison them so a different
+  // hybrid method steered in on the next step does not treat them as such.
   const auto invalidate_slots_beyond = [&](const int depth) {
-    for (int slot = depth + 1; slot <= 3; ++slot)
+    if (rhs_groups.empty())
+      return;
+    const int ntls = CarpetX::GetGroupTimelevels(rhs_groups.front());
+    for (int slot = depth + 1; slot < ntls; ++slot)
       slot_state(slot).set_valid(valid_t(false));
   };
 
   // Classic RK4, used whenever the history is missing: t=0, recovery, a
-  // rebuilt level, or the step that first selects a hybrid method. The two
-  // swaps leave slot 0 holding f(y_n) rather than the last stage RHS.
-  // CycleTimelevels then rotates that into slot 1 for the next step.
+  // rebuilt level, or the step that first selects a hybrid method. Slot 0
+  // ends holding f(y_n) rather than the last stage RHS. CycleTimelevels
+  // then rotates that into slot 1 for the next step. History slots already
+  // filled by an earlier starter step are left alone.
   const auto hybrid_bootstrap = [&](const int depth) {
     if (verbose)
       CCTK_VINFO("  Taking RK4 step to fill prev. RHS");
@@ -520,8 +552,8 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     const auto old = copy_state(var, make_valid_all());
 
     calcrhs(1, 0.0);
-    swap_rhs_slots(0, 3);
-    const auto kaccum = copy_state(slot_state(3), make_valid_int());
+    const auto k1 = save_slot0();
+    const auto kaccum = copy_state(k1, make_valid_int());
     calcupdate(1, dt / 2, 1.0, reals<1>{dt / 2}, states<1>{&kaccum});
 
     calcrhs(2, 0.0);
@@ -544,10 +576,11 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
 
     calcrhs(4, 0.0);
     const auto k4 = slot_state(0);
+    refresh_saved(kaccum);
     calcupdate(4, dt, 0.0, reals<3>{1.0, dt / 6, dt / 6},
                states<3>{&old, &kaccum, &k4});
 
-    swap_rhs_slots(0, 3);
+    restore_slot0(k1);
     invalidate_slots_beyond(depth);
   };
 
@@ -732,28 +765,29 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       const CCTK_REAL c2{c2_pure * dt};
       const CCTK_REAL c3{c3_pure * dt};
 
-      // Entry, after CycleTimelevels: [scratch, f(y_{n-1}), dead, dead]
+      // Entry, after CycleTimelevels: slot 1 holds f(y_{n-1}).
       const auto old = copy_state(var, make_valid_all());
       const auto k0 = slot_state(1);
 
       calcrhs(1, 0.0);
-      swap_rhs_slots(0, 3);
-      const auto k1 = slot_state(3);
+      const auto k1 = save_slot0();
       calcupdate(1, c2, 0.0, reals<3>{1.0, a20, a21},
                  states<3>{&old, &k0, &k1});
 
       calcrhs(2, 0.0);
-      swap_rhs_slots(0, 2);
-      const auto k2 = slot_state(2);
+      const auto k2 = save_slot0();
+      refresh_saved(k1);
       calcupdate(2, c3, 0.0, reals<4>{1.0, a30, a31, a32},
                  states<4>{&old, &k0, &k1, &k2});
 
       calcrhs(3, 0.0);
       const auto k3 = slot_state(0);
+      refresh_saved(k1);
+      refresh_saved(k2);
       calcupdate(3, dt, 0.0, reals<5>{1.0, b0, b1, b2, b3},
                  states<5>{&old, &k0, &k1, &k2, &k3});
 
-      swap_rhs_slots(0, 3);
+      restore_slot0(k1);
       invalidate_slots_beyond(depth);
     }
 
@@ -868,11 +902,10 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
         CCTK_VINFO("  Taking an IMEX Euler step to fill the explicit RHS");
 
       calcrhs(1, 0.0);
-      swap_rhs_slots(0, 3);
-      const auto k1 = slot_state(3);
+      const auto k1 = save_slot0();
       calcupdate(1, dt, 1.0, reals<1>{dt}, states<1>{&k1});
       source_step(1, dt);
-      swap_rhs_slots(0, 3);
+      restore_slot0(k1);
       invalidate_slots_beyond(depth);
 
     } else {
@@ -883,26 +916,27 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       bool have_saved = false;
 
       calcrhs(1, 0.0);
-      swap_rhs_slots(0, 3);
-      const auto k1 = slot_state(3);
+      const auto k1 = save_slot0();
       calcupdate(1, c2, 0.0, reals<3>{1.0, a20, a21},
                  states<3>{&old, &k0, &k1});
       relax_stage(1, c2, saved, have_saved);
 
       calcrhs(2, 0.0);
-      swap_rhs_slots(0, 2);
-      const auto k2 = slot_state(2);
+      const auto k2 = save_slot0();
+      refresh_saved(k1);
       calcupdate(2, c3, 0.0, reals<4>{1.0, a30, a31, a32},
                  states<4>{&old, &k0, &k1, &k2});
       relax_stage(2, c3, saved, have_saved);
 
       calcrhs(3, 0.0);
       const auto k3 = slot_state(0);
+      refresh_saved(k1);
+      refresh_saved(k2);
       calcupdate(3, dt, 0.0, reals<5>{1.0, b0, b1, b2, b3},
                  states<5>{&old, &k0, &k1, &k2, &k3});
       source_step(4, dt);
 
-      swap_rhs_slots(0, 3);
+      restore_slot0(k1);
       invalidate_slots_beyond(depth);
     }
 
@@ -938,9 +972,8 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       CCTK_ERROR("RK42-IMEX2L DIRK diagonal must lie in (0, 1)");
 
     // Build the DIRK base in var, solve Z = base + gamma*dt*g(Z), and
-    // optionally recover g = (Z - base) / (gamma*dt) into the current RHS
-    // slot. The caller's RHS views must be slot_state() results: a saved
-    // statecomp_t keeps the MultiFab from before SwapGroupTimelevels.
+    // optionally recover g = (Z - base) / (gamma*dt) into RHS slot 0.
+    // Pass copies of any explicit RHS that must survive that write.
     const auto take_dirk =
         [&](const int n, const CCTK_REAL stage_time,
             const vector<CCTK_REAL> &factors,
@@ -987,8 +1020,8 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
     };
 
     // copy() shares the RHS group's validity flags and keeps its own
-    // MultiFab. mark_invalid and SwapGroupTimelevels retarget those flags
-    // while the saved source is still the one the later stages need.
+    // MultiFab. mark_invalid clears time level 0, so mark the saved
+    // interior valid again before the next combination.
     const auto refresh_saved_g = [](const statecomp_t &g) {
       g.set_valid(make_valid_int());
     };
@@ -1004,37 +1037,38 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
 
       const auto old = copy_state(var, make_valid_all());
       calcrhs(1, 0.0);
-      swap_rhs_slots(0, 3);
-      const auto k1 = slot_state(3);
+      const auto k1 = save_slot0();
       const auto g1 =
           take_dirk(1, gamma_dt, vector<CCTK_REAL>{CCTK_REAL(1), gamma_dt},
                     vector<const statecomp_t *>{&old, &k1}, true);
 
       refresh_saved_g(g1);
+      refresh_saved(k1);
       calcupdate(2, dt / 2, 0.0, reals<3>{CCTK_REAL(1), dt / 2, dt / 2},
                  states<3>{&old, &k1, &g1});
       calcrhs(2, 0.0);
-      const auto k2 = copy_state(slot_state(0), make_valid_int());
+      const auto k2 = save_slot0();
 
       refresh_saved_g(g1);
       calcupdate(3, dt / 2, 0.0, reals<3>{CCTK_REAL(1), dt / 2, dt / 2},
                  states<3>{&old, &k2, &g1});
       calcrhs(3, 0.0);
-      const auto k3 = copy_state(slot_state(0), make_valid_int());
+      const auto k3 = save_slot0();
 
       refresh_saved_g(g1);
       calcupdate(4, dt, 0.0, reals<3>{CCTK_REAL(1), dt, dt},
                  states<3>{&old, &k3, &g1});
       calcrhs(4, 0.0);
-      const auto k4 = copy_state(slot_state(0), make_valid_int());
+      const auto k4 = save_slot0();
 
       refresh_saved_g(g1);
+      refresh_saved(k1);
       take_dirk(5, dt,
                 vector<CCTK_REAL>{CCTK_REAL(1), dt / 6, dt / 3, dt / 3,
                                   dt / 6, implicit_weight},
                 vector<const statecomp_t *>{&old, &k1, &k2, &k3, &k4, &g1},
                 true);
-      swap_rhs_slots(0, 3);
+      restore_slot0(k1);
       invalidate_slots_beyond(depth);
 
     } else {
@@ -1071,32 +1105,34 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       const auto k0 = slot_state(1);
 
       calcrhs(1, 0.0);
-      swap_rhs_slots(0, 3);
-      const auto k1 = slot_state(3);
+      const auto k1 = save_slot0();
       const auto g1 =
           take_dirk(1, gamma_dt, vector<CCTK_REAL>{CCTK_REAL(1), gamma_dt},
                     vector<const statecomp_t *>{&old, &k1}, true);
 
       refresh_saved_g(g1);
+      refresh_saved(k1);
       calcupdate(2, c2, 0.0, reals<4>{CCTK_REAL(1), a20, a21, c2},
                  states<4>{&old, &k0, &k1, &g1});
       calcrhs(2, 0.0);
-      swap_rhs_slots(0, 2);
-      const auto k2 = slot_state(2);
+      const auto k2 = save_slot0();
 
       refresh_saved_g(g1);
+      refresh_saved(k1);
       calcupdate(3, c3, 0.0, reals<5>{CCTK_REAL(1), a30, a31, a32, c3},
                  states<5>{&old, &k0, &k1, &k2, &g1});
       calcrhs(3, 0.0);
       const auto k3 = slot_state(0);
 
       refresh_saved_g(g1);
+      refresh_saved(k1);
+      refresh_saved(k2);
       take_dirk(4, dt,
                 vector<CCTK_REAL>{CCTK_REAL(1), b0, b1, b2, b3,
                                   implicit_weight},
                 vector<const statecomp_t *>{&old, &k0, &k1, &k2, &k3, &g1},
                 true);
-      swap_rhs_slots(0, 3);
+      restore_slot0(k1);
       invalidate_slots_beyond(depth);
     }
 
@@ -1135,24 +1171,24 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       const CCTK_REAL a32{a32_pure * dt};
       const CCTK_REAL c3{c3_pure * dt};
 
-      // Entry, after CycleTimelevels:
-      // [scratch, f(y_{n-1}), f(y_{n-2}), dead]
+      // Entry, after CycleTimelevels: slot 1 holds f(y_{n-1}), slot 2
+      // holds f(y_{n-2}).
       const auto old = copy_state(var, make_valid_all());
       const auto k0 = slot_state(2);
       const auto k1 = slot_state(1);
 
       calcrhs(1, 0.0);
-      swap_rhs_slots(0, 3);
-      const auto k2 = slot_state(3);
+      const auto k2 = save_slot0();
       calcupdate(1, c3, 0.0, reals<4>{1.0, a30, a31, a32},
                  states<4>{&old, &k0, &k1, &k2});
 
       calcrhs(2, 0.0);
       const auto k3 = slot_state(0);
+      refresh_saved(k2);
       calcupdate(2, dt, 0.0, reals<5>{1.0, b0, b1, b2, b3},
                  states<5>{&old, &k0, &k1, &k2, &k3});
 
-      swap_rhs_slots(0, 3);
+      restore_slot0(k2);
       invalidate_slots_beyond(depth);
     }
 

@@ -25,7 +25,12 @@ The default tags (no `checkpoint` or `evolve` tag) satisfy the first two rules.
 
 `RK4-2` and `RK4-3` are the multistep Runge-Kutta methods from
 arXiv:2603.05763. They keep previous RHS evaluations in time levels of the
-RHS groups, so each RHS group needs `TIMELEVELS=4` in its `interface.ccl`.
+RHS groups. `ODESolvers::rhs_timelevels = 0` allocates the minimum the
+current method needs: 2 for `RK4-2`, `RK42-IMEX`, and `RK42-IMEX2L`, 3 for
+`RK4-3`, and 1 for every one-step method. Each RHS group still declares
+`TIMELEVELS=4` in its `interface.ccl`, which is the ceiling, because
+`ODESolvers::method` is steerable. A positive `rhs_timelevels` must be at
+least that minimum and at most the declaration.
 `RK4_dash_2_sol` selects published solution (1) (the default) or (2). The
 first steps, and any step whose history was invalidated by regridding or
 recovery, take a classic RK4 step to fill that history. These methods are
