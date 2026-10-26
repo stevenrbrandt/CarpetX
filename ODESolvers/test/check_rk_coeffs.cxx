@@ -3,6 +3,8 @@
 
 #include "../src/RK4-2_coeffs.hpp"
 #include "../src/RK4-3_coeffs.hpp"
+#include "../src/RK42_IMEX2L_coeffs.hpp"
+#include "../src/IMEX32L_coeffs.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -92,6 +94,95 @@ int main() {
   expect_eq("RK4-3 sum b", b0 + b1 + b2 + b3, 1.0);
   expect_eq("RK4-3 row", a30 + a31 + a32, c3);
 
+  const double g = rk42_imex2l_gamma<double>();
+  if (!(g > 0.0) || !(g < 0.5)) {
+    std::cerr << "RK42-IMEX2L gamma " << g << " is outside (0, 1/2)\n";
+    std::exit(1);
+  }
+  expect_eq("RK42-IMEX2L gamma", g, 1.0 - std::sqrt(2.0) / 2.0);
+  // 2*gamma - gamma^2 = 1/2 is the implicit order-2 moment. gamma is not
+  // a dyadic rational, so allow a few ulps.
+  const double implicit_moment = (1.0 - g) * g + g * 1.0;
+  if (!(std::abs(implicit_moment - 0.5) <= 1e-12)) {
+    std::cerr << "RK42-IMEX2L implicit moment " << implicit_moment << "\n";
+    std::exit(1);
+  }
+  expect_eq("RK42-IMEX2L implicit weight sum", (1.0 - g) + g, 1.0);
+
+  const double b3_s1 = 1.0 - (s1.b0 + s1.b1 + s1.b2);
+  const double explicit_moment =
+      s1.b0 * (-1.0) + s1.b1 * 0.0 + s1.b2 * s1.c2 + b3_s1 * s1.c3;
+  if (!(std::abs(explicit_moment - 0.5) <= 1e-12)) {
+    std::cerr << "RK4-2(1) node moment " << explicit_moment << "\n";
+    std::exit(1);
+  }
+
+  // Pareschi and Russo, J. Sci. Comput. 25 (2005), Table 5.
+  // Nodes are the row sums. The four second-order conditions are
+  // b·c = 1/2 for each part and for each cross pairing. The entries are
+  // the ones both solvers load.
+  const double g32 = ODESolvers::imex32l_gamma<double>();
+  expect_eq("IMEX32L gamma", g32, 1.0 - 1.0 / std::sqrt(2.0));
+  double a_imp[3][3];
+  double row_exp[3] = {0, 0, 0};
+  double row_imp[3] = {0, 0, 0};
+  double bsum = 0, be_ce = 0, bi_ci = 0, be_ci = 0, bi_ce = 0;
+  for (int i = 0; i < 3; ++i) {
+    const double bi = ODESolvers::imex32l_b<double>(i);
+    const double ce = ODESolvers::imex32l_c_exp<double>(i);
+    const double ci = ODESolvers::imex32l_c_imp<double>(i);
+    bsum += bi;
+    be_ce += bi * ce;
+    bi_ci += bi * ci;
+    be_ci += bi * ci;
+    bi_ce += bi * ce;
+    for (int j = 0; j < 3; ++j) {
+      row_exp[i] += ODESolvers::imex32l_a_exp<double>(i, j);
+      a_imp[i][j] = ODESolvers::imex32l_a_imp<double>(i, j);
+      row_imp[i] += a_imp[i][j];
+    }
+    expect_eq("IMEX32L explicit node", row_exp[i], ce);
+    expect_eq("IMEX32L implicit node", row_imp[i], ci);
+  }
+  expect_eq("IMEX32L weight sum", bsum, 1.0);
+  expect_eq("IMEX32L explicit moment", be_ce, 0.5);
+  expect_eq("IMEX32L implicit moment", bi_ci, 0.5);
+  expect_eq("IMEX32L flux-on-implicit moment", be_ci, 0.5);
+  expect_eq("IMEX32L source-on-explicit moment", bi_ce, 0.5);
+  // The explicit part is Shu's SSPRK3, so it is order 3 on its own:
+  // sum b c^2 = 1/3 and sum_i b_i (A c)_i = 1/6.
+  double be_ce2 = 0;
+  double ac[3] = {0, 0, 0};
+  for (int i = 0; i < 3; ++i) {
+    const double bi = ODESolvers::imex32l_b<double>(i);
+    const double ce = ODESolvers::imex32l_c_exp<double>(i);
+    be_ce2 += bi * ce * ce;
+    for (int j = 0; j < 3; ++j)
+      ac[i] += ODESolvers::imex32l_a_exp<double>(i, j) *
+               ODESolvers::imex32l_c_exp<double>(j);
+  }
+  double stage3 = 0;
+  for (int i = 0; i < 3; ++i)
+    stage3 += ODESolvers::imex32l_b<double>(i) * ac[i];
+  expect_eq("IMEX32L explicit third moment", be_ce2, 1.0 / 3.0);
+  expect_eq("IMEX32L explicit stage order", stage3, 1.0 / 6.0);
+  // L-stability as stated by Pareschi and Russo: b^T A^{-1} e = 1.
+  // A is lower triangular, so forward substitution solves A x = e.
+  double x[3];
+  x[0] = 1.0 / a_imp[0][0];
+  x[1] = (1.0 - a_imp[1][0] * x[0]) / a_imp[1][1];
+  x[2] = (1.0 - a_imp[2][0] * x[0] - a_imp[2][1] * x[1]) / a_imp[2][2];
+  double lstab = 0;
+  for (int i = 0; i < 3; ++i)
+    lstab += ODESolvers::imex32l_b<double>(i) * x[i];
+  if (!(std::abs(lstab - 1.0) <= 1e-12)) {
+    std::cerr << "IMEX32L L-stability " << lstab << "\n";
+    std::exit(1);
+  }
+
   std::cout << "RK4-2 and RK4-3 coefficients match the published fractions\n";
+  std::cout << "RK42-IMEX2L DIRK weights satisfy the order-2 moment\n";
+  std::cout << "IMEX32L matches Pareschi and Russo Table 5 through order 2, "
+               "and its explicit part through order 3\n";
   return 0;
 }
