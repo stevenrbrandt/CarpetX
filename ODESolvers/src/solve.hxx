@@ -247,6 +247,13 @@ inline std::vector<int> get_group_dependents(const int gi) {
   return dependents;
 }
 
+// Defined in odesolvers_solve.cxx. method and rhs_timelevels are steerable,
+// so both drivers call this again before they cache MultiFab pointers.
+// requested == 0 allocates the minimum for method. A positive value must
+// be at least that minimum and at most the group's TIMELEVELS declaration.
+void setup_rhs_storage(const char *method, int requested, bool verbose,
+                       bool use_subcycling);
+
 // Mark groups as invalid
 inline void mark_invalid(const std::vector<int> &groups) {
   CarpetX::active_levels->loop_serially([&](const auto &leveldata) {

@@ -3,6 +3,7 @@
 #include <cctk.h>
 #include <cctk_Parameters.h>
 #include <cctk_Arguments.h>
+#include <cctk_Parameter.h>
 
 #include <cassert>
 #include <cmath>
@@ -155,6 +156,54 @@ extern "C" void TestODESolvers2_Error(CCTK_ARGUMENTS) {
                  double(exp2_err), double(exp_order_(p.I)));
     }
   });
+}
+
+// The allocator lives in ODESolvers. This check is the regression for
+// "always allocate 4": rhs_timelevels = 0 must keep one-step methods at
+// 1 level, RK4-2 / RK42-IMEX / RK42-IMEX2L at 2, and RK4-3 at 3.
+extern "C" void TestODESolvers2_CheckRHSTimelevels(CCTK_ARGUMENTS) {
+  DECLARE_CCTK_ARGUMENTS_TestODESolvers2_CheckRHSTimelevels;
+  DECLARE_CCTK_PARAMETERS;
+
+  int type = -1;
+  const void *const method_p =
+      CCTK_ParameterGet("method", "ODESolvers", &type);
+  if (!method_p || type != PARAMETER_KEYWORD)
+    CCTK_ERROR("Could not read ODESolvers::method");
+  // Keyword storage is the address of a const char *, not the string itself.
+  const char *const method = *static_cast<const char *const *>(method_p);
+
+  type = -1;
+  const void *const requested_p =
+      CCTK_ParameterGet("rhs_timelevels", "ODESolvers", &type);
+  if (!requested_p || type != PARAMETER_INT)
+    CCTK_ERROR("Could not read ODESolvers::rhs_timelevels");
+  const int requested = *static_cast<const CCTK_INT *>(requested_p);
+
+  int minimum = 1;
+  if (CCTK_Equals(method, "RK4-2") || CCTK_Equals(method, "RK42-IMEX") ||
+      CCTK_Equals(method, "RK42-IMEX2L"))
+    minimum = 2;
+  else if (CCTK_Equals(method, "RK4-3"))
+    minimum = 3;
+  const int expected = requested == 0 ? minimum : requested;
+
+  const int groups[] = {CCTK_GroupIndex("TestODESolvers2::rhs"),
+                        CCTK_GroupIndex("TestODESolvers2::ode_rhs")};
+  for (const int gi : groups) {
+    if (gi < 0)
+      CCTK_ERROR("TestODESolvers2 RHS group is missing");
+    const int got = CCTK_ActiveTimeLevelsGI(cctkGH, gi);
+    if (got != expected)
+      CCTK_VERROR(
+          "Group \"%s\" has %d active time level(s); method \"%s\" with "
+          "ODESolvers::rhs_timelevels = %d requires %d",
+          CCTK_FullGroupName(gi), got, method, requested, expected);
+  }
+  if (cctk_iteration == cctk_itlast)
+    CCTK_VINFO("RHS time levels = %d for method \"%s\" "
+               "(ODESolvers::rhs_timelevels = %d)",
+               expected, method, requested);
 }
 
 extern "C" void TestODESolvers2_CheckSplit(CCTK_ARGUMENTS) {

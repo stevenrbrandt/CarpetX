@@ -12,6 +12,18 @@ SCHEDULE TestODESolvers2_Initial AT initial
   SYNC: ode
 } "Initialize state vector"
 
+SCHEDULE TestODESolvers2_CheckRHSTimelevels AT initial AFTER TestODESolvers2_Initial
+{
+  LANG: C
+  OPTIONS: global
+} "Abort unless RHS storage is the minimum the method needs"
+
+SCHEDULE TestODESolvers2_CheckRHSTimelevels AT analysis
+{
+  LANG: C
+  OPTIONS: global
+} "Abort unless RHS storage is still the minimum the method needs"
+
 SCHEDULE TestODESolvers2_RHS IN ODESolvers_RHS
 {
   LANG: C
