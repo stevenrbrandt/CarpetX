@@ -39,8 +39,11 @@ def _expression(node, source, names):
 def read_tableaux():
     source = (THORN / "src/imex_tableaux.hxx").read_text()
     source = re.sub(r"//[^\n]*", "", source)
-    gamma = re.search(r"imex_gamma\s*=\s*([\d.]+)\s*;", source)
-    names = {"imex_gamma": Fraction(gamma.group(1))}
+    names = {}
+    for match in re.finditer(
+            r"\b(imex_gamma|imex42_alpha|imex42_beta|imex42_eta)\s*=\s*([\d.]+)\s*;",
+            source):
+        names[match.group(1)] = Fraction(match.group(2))
     result = {}
     for name in ("imex32l", "imex42l", "imex122"):
         start = source.index("{", source.index(f"imex_tableau_t {name}"))
@@ -138,7 +141,7 @@ class TestIMEX(unittest.TestCase):
         self.assertTrue(all(tableau["ai"][i][i] > 0 for i in range(3)))
 
     def test_explicit_orders(self):
-        for name, order in (("imex32l", 3), ("imex42l", 4), ("imex122", 2)):
+        for name, order in (("imex32l", 3), ("imex42l", 3), ("imex122", 2)):
             with self.subTest(method=name):
                 errors = []
                 for n in (16, 32):
@@ -148,7 +151,8 @@ class TestIMEX(unittest.TestCase):
                 self.assertLess(abs(observed - order), 0.12)
 
     def test_implicit_and_mixed_nonautonomous_order(self):
-        # y'=a*y+p*t + b*y+q*t; actual explicit/implicit times differ for32L.
+        # y'=a*y+p*t + b*y+q*t. Table 6 is order 3. The other two are order 2.
+        orders = {"imex32l": 2, "imex42l": 3, "imex122": 2}
         for name, tableau in self.tableaux.items():
             for a, b, p, q in ((0, -1, 0, 0), (-0.3, -0.7, 0, 0),
                                (-0.3, -0.7, 0.4, -0.1), (0, -1, 0, 0.5)):
@@ -163,7 +167,7 @@ class TestIMEX(unittest.TestCase):
                                                       1 / n, a, b, p, q)
                         errors.append(abs(value - exact))
                     observed = math.log2(errors[0] / errors[1])
-                    self.assertLess(abs(observed - 2), 0.13)
+                    self.assertLess(abs(observed - orders[name]), 0.13)
 
     def test_pure_implicit_stability(self):
         for name, tableau in self.tableaux.items():
@@ -187,12 +191,10 @@ class TestIMEX(unittest.TestCase):
     def test_mixed_stiff_limit_is_not_confused_with_pure_stability(self):
         stiff = -10**16
         for explicit in (Fraction(-1), Fraction(-1, 4), Fraction(1, 2)):
-            self.assertLess(abs(amplification(self.tableaux["imex32l"], explicit, stiff)),
-                            Fraction(1, 10**12))
-            # Existing42L has a nonzero unprepared mixed stiff limit: do not
-            # advertise its pure-implicit L-stability as a TOV/AP proof.
-            self.assertAlmostEqual(float(amplification(self.tableaux["imex42l"], explicit, stiff)),
-                                   float(-explicit / 2), places=12)
+            for name in ("imex32l", "imex42l"):
+                self.assertLess(
+                    abs(amplification(self.tableaux[name], explicit, stiff)),
+                    Fraction(1, 10**12))
 
     def test_macro_ap_does_not_imply_final_equilibrium_projection(self):
         tableau = self.tableaux["imex32l"]

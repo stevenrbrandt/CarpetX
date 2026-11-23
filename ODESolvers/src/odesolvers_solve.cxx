@@ -363,9 +363,9 @@ extern "C" void ODESolvers_Solve(CCTK_ARGUMENTS) {
       }
   };
 
-  // c_exp and c_imp are the explicit and implicit abscissae. They are equal
-  // for IMEX42L. IMEX-SSP3(3,3,2) evaluates the flux and the source of a
-  // stage at different times, so the two vectors differ there.
+  // c_exp and c_imp are the explicit and implicit abscissae. IMEX32L and
+  // IMEX42L evaluate the flux and the source of a stage at different times,
+  // so the two vectors differ.
   const auto run_imex =
       [&](const imex_tableau_t &tableau) {
         const int nstages = tableau.nstages;

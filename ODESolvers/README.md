@@ -81,6 +81,32 @@ combination, so a repair made inside the implicit solve stays in the
 recovered source. The combined scheme is order 2. With the source absent
 it is SSPRK3, which is order 3.
 
+## IMEX42L
+
+`IMEX42L` is the IMEX-SSP3(4,3,3) scheme in Table 6 of Pareschi and
+Russo, the same paper as `IMEX32L`. The explicit part is SSPRK3, with
+a leading stage whose flux weight is zero. Its nodes are \(0\), \(0\),
+\(1\), and \(1/2\). The implicit part is an L-stable DIRK. Every
+diagonal is the Table 6 value \(\alpha = 0.24169426078821\), so each
+step takes four implicit solves of size \(\alpha\Delta t\). The
+implicit nodes are \(\alpha\), \(0\), \(1\), and \(1/2\). The weights
+are \(0\), \(1/6\), \(1/6\), and \(2/3\). The first stage solves
+\(Y = y_n + \alpha\Delta t\, g(Y)\). It does not evaluate the stiff
+source explicitly.
+
+The scheme that used to be stored under this name paired classic RK4
+with an implicit matrix whose first diagonal was 0. That matrix is the
+I42L(4,2) tableau. Its first stage stored the stiff rate, and the next
+stage added \(\Delta t/4\) times that rate before primitive recovery.
+Table 6 replaces it. The keyword is unchanged. The flux weights in the
+Runge-Kutta method table are the Table 6 weights, not the RK4 weights.
+
+The second implicit stage begins with \(-\alpha\). A later stage
+predictor can leave the range of the data. The predictor is a
+combination of solved stages. The combined scheme is order 3. With the
+source absent it is SSPRK3, which is order 3. A repair made inside an
+implicit solve stays in the recovered source, as it does for `IMEX32L`.
+
 ## Subcycling
 
 Add the following parameters to your parameter file
@@ -99,9 +125,10 @@ Both drivers use `src/imex_tableaux.hxx`. Implicit increments are recovered
 before `PostStep` numerical projections. No extra final implicit projection
 is applied. Flux registers use the same explicit weights as the accepted state.
 
-- `IMEX42L` retains Table 10 of [Izquierdo et al.](https://arxiv.org/html/2211.00027v2).
-  The explicit part is RK4; the additive scheme is second order. Its implicit
-  part is L-stable, but that alone is not a stiff coupled-transport guarantee.
+- `IMEX42L` is Table 6 of Pareschi and Russo, described above. It replaces
+  Table 10 of [Izquierdo et al.](https://arxiv.org/html/2211.00027v2). The
+  explicit part is SSPRK3 and the additive scheme is order 3. Its implicit
+  part is L-stable. That alone is not a stiff coupled-transport guarantee.
 - `IMEX32L` now uses the L-stable IMEX-SSP3(3,3,2) in Table 5 of
   [Pareschi and Russo](https://arxiv.org/pdf/1009.2757). Its explicit part is
   SSPRK3, and its implicit diagonal is `gamma=1-1/sqrt(2)` at all three stages.
@@ -122,8 +149,9 @@ at their actual parent-step fractions. This is linear time interpolation, not
 a new high-order IMEX dense-output formula.
 
 For the scalar split `y'=(lambda_E+lambda_I)*y`, at fixed `z_E=lambda_E*dt`,
-the unprepared stiff limit `z_I -> -infinity` is zero for corrected `IMEX32L`,
-but `-z_E/2` for `IMEX42L`. Midpoint's pure implicit amplification tends to
+the unprepared stiff limit `z_I -> -infinity` is zero for corrected `IMEX32L`
+and for Table 6 `IMEX42L`. The replaced Izquierdo Table 10 limit was `-z_E/2`.
+Midpoint's pure implicit amplification tends to
 `-1`. Do not equate pure-implicit L-stability, nonautonomous order, prepared
 diffusion accuracy, or nonlinear radiation-matter stability: test each.
 

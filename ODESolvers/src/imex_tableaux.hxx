@@ -3,6 +3,8 @@
 
 #include <cctk.h>
 
+#include "IMEX42L_coeffs.hpp"
+
 #include <array>
 #include <limits>
 
@@ -17,18 +19,31 @@ struct imex_tableau_t {
   std::array<CCTK_REAL, 4> b_exp, b_imp;
 };
 
-// Izquierdo et al., arXiv:2211.00027v2, Table 10. The implicit part is
-// L-stable; this does not imply a uniformly damped mixed stiff limit.
+// Pareschi and Russo, J. Sci. Comput. 25 (2005) 129-155, Table 6:
+// IMEX-SSP3(4,3,3). The explicit part is SSPRK3 with a leading stage whose
+// flux weight is zero. The implicit part is an L-stable DIRK; every diagonal
+// is imex42_alpha, so each stage solves a step of that size. Printed
+// decimals only. IMEX42L_coeffs.hpp repeats these decimals for the
+// standalone coefficient check; the static assert below keeps them together.
+// This replaces Izquierdo et al. arXiv:2211.00027v2 Table 10, whose first
+// implicit diagonal is zero. Not stiffly accurate. The second implicit stage
+// begins with -alpha, so a predictor can leave the data range.
+inline constexpr CCTK_REAL imex42_alpha = 0.24169426078821;
+inline constexpr CCTK_REAL imex42_beta = 0.06042356519705;
+inline constexpr CCTK_REAL imex42_eta = 0.12915286960590;
 inline constexpr imex_tableau_t imex42l{
     4,
-    {0, 1.0 / 2, 1.0 / 2, 1},
-    {0, 1.0 / 2, 1.0 / 2, 1},
-    {{{0, 0, 0, 0}, {1.0 / 2, 0, 0, 0},
-      {0, 1.0 / 2, 0, 0}, {0, 0, 1, 0}}},
-    {{{0, 0, 0, 0}, {1.0 / 4, 1.0 / 4, 0, 0},
-      {0, 1.0 / 6, 1.0 / 3, 0}, {1.0 / 6, 1.0 / 3, 1.0 / 3, 1.0 / 6}}},
-    {1.0 / 6, 1.0 / 3, 1.0 / 3, 1.0 / 6},
-    {1.0 / 6, 1.0 / 3, 1.0 / 3, 1.0 / 6}};
+    {0, 0, 1, 1.0 / 2},
+    {imex42_alpha, 0, 1, 1.0 / 2},
+    {{{0, 0, 0, 0}, {0, 0, 0, 0},
+      {0, 1, 0, 0}, {0, 1.0 / 4, 1.0 / 4, 0}}},
+    {{{imex42_alpha, 0, 0, 0},
+      {-imex42_alpha, imex42_alpha, 0, 0},
+      {0, 1 - imex42_alpha, imex42_alpha, 0},
+      {imex42_beta, imex42_eta,
+       1.0 / 2 - imex42_beta - imex42_eta - imex42_alpha, imex42_alpha}}},
+    {0, 1.0 / 6, 1.0 / 6, 2.0 / 3},
+    {0, 1.0 / 6, 1.0 / 6, 2.0 / 3}};
 
 // Pareschi and Russo, arXiv:1009.2757, Table 5: IMEX-SSP3(3,3,2).
 // gamma=1-1/sqrt(2). This replaces the inconsistent printed CK tableau
@@ -96,6 +111,27 @@ constexpr bool imex_tableau_consistent(const imex_tableau_t &tableau) {
 static_assert(imex_tableau_consistent(imex42l));
 static_assert(imex_tableau_consistent(imex32l));
 static_assert(imex_tableau_consistent(imex122));
+
+// The standalone header cannot include this file. Reject a drift between them.
+static_assert([] {
+  if (imex42l.nstages != 4)
+    return false;
+  for (int i = 0; i < 4; ++i) {
+    if (imex42l.c_exp[i] != imex42l_c_exp<CCTK_REAL>(i) ||
+        imex42l.c_imp[i] != imex42l_c_imp<CCTK_REAL>(i) ||
+        imex42l.b_exp[i] != imex42l_b<CCTK_REAL>(i) ||
+        imex42l.b_imp[i] != imex42l_b<CCTK_REAL>(i))
+      return false;
+    for (int j = 0; j < 4; ++j) {
+      if (imex42l.a_exp[i][j] != imex42l_a_exp<CCTK_REAL>(i, j) ||
+          imex42l.a_imp[i][j] != imex42l_a_imp<CCTK_REAL>(i, j))
+        return false;
+    }
+  }
+  return imex42_alpha == imex42l_alpha<CCTK_REAL>() &&
+         imex42_beta == imex42l_beta<CCTK_REAL>() &&
+         imex42_eta == imex42l_eta<CCTK_REAL>();
+}());
 
 } // namespace ODESolvers
 
